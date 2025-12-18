@@ -1,8 +1,7 @@
 customtkinter
 Pillow
-google-generativeai
 python-dotenv
 requests
 terragen-rpc
-opensimplex
 scipy
+opensimplex

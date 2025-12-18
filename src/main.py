@@ -30,26 +30,16 @@ class TerrainApp(ctk.CTk):
         self.logo_label = ctk.CTkLabel(self.sidebar_frame, text="Terrain AI", font=ctk.CTkFont(size=20, weight="bold"))
         self.logo_label.grid(row=0, column=0, padx=20, pady=(20, 10))
 
-        self.upload_btn = ctk.CTkButton(self.sidebar_frame, text="Upload Images", command=self.upload_images)
+        self.upload_btn = ctk.CTkButton(self.sidebar_frame, text="Upload Reference Images", command=self.upload_images)
         self.upload_btn.grid(row=1, column=0, padx=20, pady=10)
 
-        self.hf_btn = ctk.CTkButton(self.sidebar_frame, text="Select Heightfield", command=self.select_heightfield)
-        self.hf_btn.grid(row=2, column=0, padx=20, pady=10)
+        self.gen_texture_var = ctk.BooleanVar(value=True)
+        self.gen_texture_chk = ctk.CTkCheckBox(self.sidebar_frame, text="Generate Texture", variable=self.gen_texture_var)
+        self.gen_texture_chk.grid(row=2, column=0, padx=20, pady=10)
 
-        self.gen_hf_btn = ctk.CTkButton(self.sidebar_frame, text="Generate Heightfield", fg_color="#800080", hover_color="#4b0082", command=self.start_heightfield_generation)
+        self.gen_hf_btn = ctk.CTkButton(self.sidebar_frame, text="Generate Heightfield Images", fg_color="#800080", hover_color="#4b0082", command=self.start_heightfield_generation)
         self.gen_hf_btn.grid(row=3, column=0, padx=20, pady=10)
         self.gen_hf_btn.configure(state="disabled")
-
-        self.generate_btn = ctk.CTkButton(self.sidebar_frame, text="Generate Terrain", command=self.start_generation)
-        self.generate_btn.grid(row=4, column=0, padx=20, pady=10)
-        self.generate_btn.configure(state="disabled")
-
-        self.load_btn = ctk.CTkButton(self.sidebar_frame, text="Load Project (JSON)", command=self.load_project)
-        self.load_btn.grid(row=5, column=0, padx=20, pady=10)
-
-        self.save_btn = ctk.CTkButton(self.sidebar_frame, text="Save Project (JSON)", command=self.save_project)
-        self.save_btn.grid(row=6, column=0, padx=20, pady=10)
-        self.save_btn.configure(state="disabled")
 
         self.quit_btn = ctk.CTkButton(self.sidebar_frame, text="Quit", fg_color="red", hover_color="darkred", command=self.quit_app)
         self.quit_btn.grid(row=7, column=0, padx=20, pady=10)
@@ -451,17 +441,11 @@ class TerrainApp(ctk.CTk):
                 return
             hf_path = self.heightfield_path
             
-            # Try to get texture from last result
-            if self.last_result and "generated_images" in self.last_result and self.last_result["generated_images"]:
-                try:
-                    # Save first image as texture
-                    tex_path = os.path.abspath("generated_texture_temp.png")
-                    self.last_result["generated_images"][0].save(tex_path)
-                    self.log_message(f"Saved generated texture to {tex_path}")
-                except Exception as e:
-                    self.log_message(f"Failed to save generated texture: {e}")
+            # Use generated texture if available
+            if hasattr(self, 'generated_texture_path') and self.generated_texture_path:
+                tex_path = self.generated_texture_path
             else:
-                self.log_message("No generated texture found in results.")
+                self.log_message("No generated texture found.")
 
         elif mode == "Uploaded Images":
             # Use generated HF if available, else manual
@@ -504,17 +488,8 @@ class TerrainApp(ctk.CTk):
         if filenames:
             self.image_paths = list(filenames)
             self.display_uploaded_images()
-            self.generate_btn.configure(state="normal")
             self.gen_hf_btn.configure(state="normal")
             self.log_message(f"{len(self.image_paths)} images selected.")
-
-    def select_heightfield(self):
-        filetypes = (("Heightfield files", "*.ter *.tif *.exr *.png *.jpg"), ("All files", "*.*"))
-        filename = filedialog.askopenfilename(title="Select Heightfield Image", filetypes=filetypes)
-        if filename:
-            self.heightfield_path = filename
-            self.log_message(f"Selected Heightfield: {os.path.basename(filename)}")
-            self.generate_btn.configure(state="normal")
 
     def display_uploaded_images(self):
         for widget in self.images_frame.winfo_children():
@@ -552,7 +527,6 @@ class TerrainApp(ctk.CTk):
             
             # Update button states if list is empty
             if not self.image_paths:
-                self.generate_btn.configure(state="disabled")
                 self.gen_hf_btn.configure(state="disabled")
 
     def start_heightfield_generation(self):
@@ -564,75 +538,105 @@ class TerrainApp(ctk.CTk):
     def process_heightfield_generation(self):
         try:
             callback = lambda msg: self.after(0, self.log_message, msg)
-            script_code = self.api.generate_heightmap_script(self.image_paths, status_callback=callback)
             
-            if not script_code:
-                raise Exception("Failed to generate heightmap script.")
+            # Call API to generate images directly
+            generate_texture = self.gen_texture_var.get()
+            generated_images = self.api.generate_heightmap_images(self.image_paths, generate_texture=generate_texture, status_callback=callback)
+            
+            if not generated_images:
+                raise Exception("No images were generated by the AI.")
 
-            # Save script to file
-            script_path = os.path.abspath("generate_hf.py")
-            with open(script_path, "w") as f:
-                f.write(script_code)
+            self.after(0, self.log_message, f"Received {len(generated_images)} images from AI.")
             
-            self.after(0, self.log_message, f"Executing script: {script_path}")
-            
-            # Execute script using current python interpreter
-            result = subprocess.run([sys.executable, script_path], capture_output=True, text=True)
-            
-            # Log output
-            if result.stdout: print(f"Script STDOUT: {result.stdout}")
-            if result.stderr: print(f"Script STDERR: {result.stderr}")
+            # Create Output Directory
+            output_dir = "highfield_output"
+            if not os.path.exists(output_dir):
+                os.makedirs(output_dir)
+                self.after(0, self.log_message, f"Created output directory: {output_dir}")
 
-            if result.returncode != 0:
-                raise Exception(f"Script execution failed: {result.stderr}")
-            
-            self.after(0, self.log_message, "Heightmap generation script finished.")
-            
-            # Rename with timestamp
+            # Save Images with Timestamp
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            default_output = "generated_heightmap.png"
             
-            # Ensure we look in the same dir as the script
-            if not os.path.exists(default_output):
-                default_output = os.path.abspath(default_output)
+            # Handle Single Image Response (Potential Side-by-Side)
+            final_images = []
+            if len(generated_images) == 1:
+                img = generated_images[0]
+                width, height = img.size
+                # If width is significantly larger than height (e.g., > 1.8 aspect ratio), assume side-by-side
+                if width > height * 1.5:
+                    self.after(0, self.log_message, "Detected side-by-side image. Splitting...")
+                    # Split into two
+                    half_width = width // 2
+                    hf_part = img.crop((0, 0, half_width, height))
+                    tex_part = img.crop((half_width, 0, width, height))
+                    final_images = [hf_part, tex_part]
+                else:
+                    final_images = [img]
+            else:
+                final_images = generated_images
 
-            if not os.path.exists(default_output):
-                # Debug info
-                cwd = os.getcwd()
-                files = os.listdir(cwd)
-                print(f"CWD: {cwd}")
-                print(f"Files: {files}")
-                raise Exception(f"Output file {default_output} not found. Check console for details.")
-
-            new_filename = f"generated_heightmap_{timestamp}.png"
-            hf_path = os.path.abspath(new_filename)
-            
-            os.rename(default_output, hf_path)
-
+            # Save Heightmap
+            hf_img = final_images[0]
+            hf_filename = f"generated_heightmap_{timestamp}.png"
+            hf_path = os.path.abspath(os.path.join(output_dir, hf_filename))
+            hf_img.save(hf_path)
             self.heightfield_path = hf_path
             
+            tex_path = None
+            if len(final_images) > 1:
+                tex_img = final_images[1]
+                tex_filename = f"generated_texture_{timestamp}.png"
+                tex_path = os.path.abspath(os.path.join(output_dir, tex_filename))
+                tex_img.save(tex_path)
+                self.generated_texture_path = tex_path
+            else:
+                self.generated_texture_path = None
+
             def update_ui():
-                self.log_message(f"Heightfield set to: {os.path.basename(hf_path)}")
+                self.log_message(f"Heightfield saved: {os.path.basename(hf_path)}")
+                if tex_path:
+                    self.log_message(f"Texture saved: {os.path.basename(tex_path)}")
+                
                 self.gen_hf_btn.configure(state="normal")
                 
-                # Display the generated heightmap
+                # Clear previous results
+                for widget in self.results_frame.winfo_children():
+                    widget.destroy()
+
+                # Display Heightmap
                 try:
-                    img = Image.open(hf_path)
+                    img = hf_img.copy()
                     img.thumbnail((300, 300))
                     ctk_img = ctk.CTkImage(light_image=img, dark_image=img, size=img.size)
                     
-                    # Clear previous results to show this new one
-                    for widget in self.results_frame.winfo_children():
-                        widget.destroy()
-                        
-                    lbl = ctk.CTkLabel(self.results_frame, text=f"Generated Heightfield\n{os.path.basename(hf_path)}", font=ctk.CTkFont(weight="bold"))
+                    hf_frame = ctk.CTkFrame(self.results_frame)
+                    hf_frame.pack(side="left", padx=10, pady=10)
+                    
+                    lbl = ctk.CTkLabel(hf_frame, text=f"Heightfield\n{os.path.basename(hf_path)}", font=ctk.CTkFont(weight="bold"))
                     lbl.pack(pady=5)
                     
-                    img_lbl = ctk.CTkLabel(self.results_frame, image=ctk_img, text="")
+                    img_lbl = ctk.CTkLabel(hf_frame, image=ctk_img, text="")
                     img_lbl.pack(pady=10)
-                    
                 except Exception as e:
                     print(f"Error displaying heightmap: {e}")
+
+                # Display Texture
+                if tex_path:
+                    try:
+                        img = Image.open(tex_path)
+                        img.thumbnail((300, 300))
+                        ctk_img = ctk.CTkImage(light_image=img, dark_image=img, size=img.size)
+                        
+                        tex_frame = ctk.CTkFrame(self.results_frame)
+                        tex_frame.pack(side="left", padx=10, pady=10)
+                        
+                        lbl = ctk.CTkLabel(tex_frame, text=f"Texture\n{os.path.basename(tex_path)}", font=ctk.CTkFont(weight="bold"))
+                        lbl.pack(pady=5)
+                        
+                        img_lbl = ctk.CTkLabel(tex_frame, image=ctk_img, text="")
+                        img_lbl.pack(pady=10)
+                    except Exception as e:
+                        print(f"Error displaying texture: {e}")
 
             self.after(0, update_ui)
 
@@ -640,145 +644,8 @@ class TerrainApp(ctk.CTk):
             self.after(0, self.show_error, str(e))
             self.after(0, lambda: self.gen_hf_btn.configure(state="normal"))
 
-    def start_generation(self):
-        self.log_message("Starting generation process...")
-        self.generate_btn.configure(state="disabled")
-        
-        # Run in a separate thread to keep UI responsive
-        thread = threading.Thread(target=self.process_generation)
-        thread.start()
-
-    def process_generation(self):
-        try:
-            # This is where we call the API
-            # We pass a lambda that uses after() to ensure UI updates happen on the main thread
-            callback = lambda msg: self.after(0, self.log_message, msg)
-            result = self.api.generate_terrain(self.image_paths, heightfield_path=self.heightfield_path, status_callback=callback)
-            self.after(0, self.display_results, result)
-        except Exception as e:
-            self.after(0, self.show_error, str(e))
-
-    def display_results(self, result):
-        self.last_result = result
-        self.log_message("Generation Complete.")
-        self.generate_btn.configure(state="normal")
-        self.save_btn.configure(state="normal")
-        
-        # Clear previous results
-        for widget in self.results_frame.winfo_children():
-            widget.destroy()
-
-        # Display Generated Images
-        if "generated_images" in result and result["generated_images"]:
-            img_frame = ctk.CTkFrame(self.results_frame)
-            img_frame.pack(fill="x", pady=10)
-            ctk.CTkLabel(img_frame, text="Generated Maps", font=ctk.CTkFont(weight="bold")).pack(anchor="w", padx=10, pady=5)
-            
-            for i, img in enumerate(result["generated_images"]):
-                try:
-                    # Resize for display
-                    display_img = img.copy()
-                    display_img.thumbnail((300, 300))
-                    ctk_img = ctk.CTkImage(light_image=display_img, dark_image=display_img, size=display_img.size)
-                    
-                    lbl = ctk.CTkLabel(img_frame, image=ctk_img, text="")
-                    lbl.pack(side="left", padx=10, pady=10)
-                    
-                    # Save button
-                    def save_img(image=img, index=i):
-                        filename = filedialog.asksaveasfilename(defaultextension=".png", filetypes=[("PNG files", "*.png")])
-                        if filename:
-                            image.save(filename)
-                            messagebox.showinfo("Saved", f"Image saved to {filename}")
-
-                    btn = ctk.CTkButton(img_frame, text=f"Save Map {i+1}", command=save_img)
-                    btn.pack(side="left", padx=5)
-                    
-                except Exception as e:
-                    print(f"Error displaying image: {e}")
-
-        # Display Atmosphere Settings
-        if "atmosphere" in result and result["atmosphere"]:
-            atm_frame = ctk.CTkFrame(self.results_frame)
-            atm_frame.pack(fill="x", pady=10)
-            ctk.CTkLabel(atm_frame, text="Atmosphere Settings", font=ctk.CTkFont(weight="bold")).pack(anchor="w", padx=10, pady=5)
-            
-            atm_text = ctk.CTkTextbox(atm_frame, height=150)
-            atm_text.pack(fill="x", padx=10, pady=5)
-            atm_text.insert("0.0", str(result["atmosphere"]))
-            atm_text.configure(state="disabled")
-
-        # Display Height Map Info
-        hm_frame = ctk.CTkFrame(self.results_frame)
-        hm_frame.pack(fill="x", pady=10)
-        ctk.CTkLabel(hm_frame, text="Terrain Description", font=ctk.CTkFont(weight="bold")).pack(anchor="w", padx=10, pady=5)
-        
-        if "height_map_text" in result:
-             lbl = ctk.CTkLabel(hm_frame, text=result["height_map_text"], wraplength=600, justify="left")
-             lbl.pack(padx=10, pady=5)
-
-        # Display Terragen RPC Code
-        if "terragen_rpc_code" in result and result["terragen_rpc_code"]:
-            code_frame = ctk.CTkFrame(self.results_frame)
-            code_frame.pack(fill="both", expand=True, pady=10)
-            
-            header_frame = ctk.CTkFrame(code_frame, fg_color="transparent")
-            header_frame.pack(fill="x", padx=10, pady=5)
-            
-            ctk.CTkLabel(header_frame, text="Terragen Script", font=ctk.CTkFont(weight="bold")).pack(side="left")
-            
-            def run_script():
-                code = result["terragen_rpc_code"]
-                try:
-                    # Execute the code in a new thread to avoid freezing UI
-                    def execute():
-                        try:
-                            exec(code, {"__name__": "__main__"})
-                            self.after(0, lambda: messagebox.showinfo("Success", "Script executed successfully! Check Terragen."))
-                        except Exception as e:
-                            error_msg = str(e)
-                            print(f"Script Execution Error: {error_msg}")
-                            self.after(0, lambda: messagebox.showerror("Execution Error", error_msg))
-                    
-                    threading.Thread(target=execute).start()
-                except Exception as e:
-                    messagebox.showerror("Error", str(e))
-
-            ctk.CTkButton(header_frame, text="Run in Terragen", fg_color="green", hover_color="darkgreen", command=run_script).pack(side="right")
-            
-            code_box = ctk.CTkTextbox(code_frame, height=300, font=("Courier", 12))
-            code_box.pack(fill="both", expand=True, padx=10, pady=5)
-            code_box.insert("0.0", result["terragen_rpc_code"])
-
-    def save_project(self):
-        if not self.last_result:
-            return
-        
-        filename = filedialog.asksaveasfilename(defaultextension=".json", filetypes=[("JSON files", "*.json")])
-        if filename:
-            try:
-                # Filter out non-serializable objects (like PIL images) if any
-                save_data = {k: v for k, v in self.last_result.items() if k != "generated_images"}
-                with open(filename, 'w') as f:
-                    json.dump(save_data, f, indent=4)
-                messagebox.showinfo("Saved", f"Project saved to {filename}")
-            except Exception as e:
-                messagebox.showerror("Error", f"Failed to save project: {e}")
-
-    def load_project(self):
-        filename = filedialog.askopenfilename(filetypes=[("JSON files", "*.json")])
-        if filename:
-            try:
-                with open(filename, 'r') as f:
-                    data = json.load(f)
-                self.display_results(data)
-                self.log_message(f"Loaded project from {filename}")
-            except Exception as e:
-                messagebox.showerror("Error", f"Failed to load project: {e}")
-
     def show_error(self, message):
         self.status_label.configure(text="Error occurred.")
-        self.generate_btn.configure(state="normal")
         messagebox.showerror("Error", message)
 
     def quit_app(self):
