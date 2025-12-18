@@ -461,6 +461,11 @@ class TerrainApp(ctk.CTk):
                 return
 
             clouds = project.children_filtered_by_class("cloud_layer")
+            if not clouds:
+                # Log what Terragen thinks exists to help debugging class name mismatches
+                all_classes = [c.path().split("/")[-1] for c in project.children()]
+                self.log_message(f"No cloud_layer nodes found. Root child classes: {all_classes}")
+
             base_name = "AI Cloud"
             idx = 1
             existing_names = {c.name() for c in clouds}
@@ -468,9 +473,22 @@ class TerrainApp(ctk.CTk):
                 idx += 1
             new_name = f"{base_name} {idx}"
 
-            new_cloud = tg.create_child(project, "cloud_layer")
+            # Try known cloud class names in order
+            new_cloud = None
+            for cloud_class in ("cloud_layer", "cloud_layer_v3", "cloud_layer_v2"):
+                try:
+                    new_cloud = tg.create_child(project, cloud_class)
+                    if new_cloud:
+                        self.log_message(f"Created cloud using class '{cloud_class}'")
+                        break
+                except Exception as create_err:
+                    self.log_message(f"Create attempt failed for class '{cloud_class}': {create_err}")
+
             if not new_cloud:
-                messagebox.showerror("Error", "Failed to create cloud layer.")
+                messagebox.showerror(
+                    "Error",
+                    "Failed to create cloud layer via RPC. Check Terragen is unlocked and RPC allows create_child for cloud_layer/cloud_layer_v3.",
+                )
                 return
 
             new_cloud.set_param("name", new_name)
