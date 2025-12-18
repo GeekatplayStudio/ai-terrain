@@ -3,3 +3,7 @@ venv/
 __pycache__/
 .DS_Store
 *.pyc
+generate_hf.py
+reproduce_issue.py
+test_api.py
+dummy.jpg

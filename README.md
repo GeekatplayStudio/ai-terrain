@@ -1,9 +1,14 @@
 # Terrain AI Generator
 
 This application allows you to upload reference photos of terrain and uses Google's Gemini Pro AI to analyze them and generate:
-1. Atmosphere settings (Sun, Clouds, Sky) for Terragen.
-2. A description of the terrain.
-3. Python code to procedurally generate a height map matching the terrain.
+1. **Terragen RPC Script**: A complete Python script that connects to Terragen Professional and procedurally creates the terrain, atmosphere, and lighting to match your images.
+2. **Visual Analysis**: A detailed description of the terrain features found in the images.
+
+## Requirements
+
+- **Terragen Professional** (running with RPC enabled)
+- Python 3.13+
+- Google Gemini API Key
 
 ## Setup
 
