@@ -72,6 +72,75 @@ class TerrainGeneratorAPI:
             
         return generated_images
 
+    def _call_gemini_text(self, content_parts, log_callback, model_name="gemini-2.0-flash"):
+        """Helper to send request to Gemini and return concatenated text"""
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={self.api_key}"
+        payload = {"contents": [{"parts": content_parts}]}
+        log_callback(f"Sending request to {model_name} for text analysis...")
+        response = requests.post(url, json=payload, headers={'Content-Type': 'application/json'})
+
+        try:
+            result_json = response.json()
+        except Exception as e:
+            log_callback(f"Failed to decode response: {e}")
+            return ""
+
+        if response.status_code != 200:
+            log_callback(f"API Error {response.status_code}: {result_json}")
+            response.raise_for_status()
+
+        try:
+            candidates = result_json.get('candidates', [])
+            if not candidates:
+                log_callback(f"No candidates returned. Feedback: {result_json.get('promptFeedback', 'N/A')}")
+                return ""
+            parts = candidates[0]['content']['parts']
+            texts = []
+            for part in parts:
+                if 'text' in part:
+                    texts.append(part['text'])
+            return "\n".join(texts).strip()
+        except Exception as e:
+            log_callback(f"Failed to extract text: {e}")
+            return ""
+
+    def analyze_sun_angles(self, image_path, status_callback=None):
+        def log(message):
+            if status_callback: status_callback(message)
+            print(message)
+
+        if not self.api_key:
+            self.api_key = os.getenv("GOOGLE_API_KEY")
+            if not self.api_key:
+                raise ValueError("Google API Key not found.")
+
+        payload = self._prepare_image_payload(image_path)
+        if not payload:
+            raise ValueError("Invalid sky reference image.")
+
+        prompt = """
+        You are a lighting TD. From the attached sky photo, estimate the sun direction.
+        Return ONLY compact JSON with keys: sun_azimuth_deg (0-360, clockwise from North) and sun_elevation_deg (-10 to 90).
+        Example: {"sun_azimuth_deg": 215, "sun_elevation_deg": 14}
+        Do not include any extra text.
+        """
+
+        parts = [payload, {"text": prompt}]
+        raw = self._call_gemini_text(parts, log)
+        if not raw:
+            raise Exception("No sun analysis returned.")
+
+        try:
+            # Attempt to extract JSON snippet
+            start = raw.find("{")
+            end = raw.rfind("}")
+            if start != -1 and end != -1:
+                snippet = raw[start:end+1]
+                return json.loads(snippet)
+        except Exception as e:
+            log(f"Failed to parse sun JSON: {e}")
+        raise Exception("Could not parse sun azimuth/elevation from analysis.")
+
     def generate_heightmap_images(self, image_paths, generate_texture=True, status_callback=None):
         def log(message):
             if status_callback: status_callback(message)
@@ -152,3 +221,31 @@ class TerrainGeneratorAPI:
         log("Texture map generated successfully.")
 
         return [heightmap_img, texture_img]
+
+    def analyze_atmosphere(self, image_path, status_callback=None):
+        def log(message):
+            if status_callback: status_callback(message)
+            print(message)
+
+        if not self.api_key:
+            self.api_key = os.getenv("GOOGLE_API_KEY")
+            if not self.api_key:
+                raise ValueError("Google API Key not found.")
+
+        payload = self._prepare_image_payload(image_path)
+        if not payload:
+            raise ValueError("Invalid sky reference image.")
+
+        prompt = """
+        You are an expert Terragen TD. Analyze the attached sky/cloud reference and describe settings to recreate the atmosphere in Terragen.
+        - Time: time of day; Sun: azimuth (deg), elevation (deg), color temperature (K), overall light tint.
+        - Clouds: list each layer with type (e.g., cumulus, stratocumulus, cirrus, altocumulus), coverage %, density/softness, base altitude km, top altitude km, notable features (anvils, wisps, towering, flat deck).
+        - Atmosphere: horizon haze/turbidity, ambient light level, aerial perspective strength, visibility km, color casts or weather hints (clear, stormy, overcast, sunset).
+        - Output concise bullet points; no JSON; keep under 120 words; no image generation instructions.
+        """
+
+        parts = [payload, {"text": prompt}]
+        result = self._call_gemini_text(parts, log)
+        if not result:
+            raise Exception("No analysis returned for sky reference.")
+        return result

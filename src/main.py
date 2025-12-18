@@ -4,72 +4,118 @@ from PIL import Image
 import os
 import sys
 import threading
-import webbrowser
-import json
-import subprocess
-from datetime import datetime
-from dotenv import load_dotenv
-from api_handler import TerrainGeneratorAPI
+    def create_cloud_node(self):
+        try:
+            import terragen_rpc as tg
+            project = tg.root()
+            if not project:
+                messagebox.showerror("Error", "Could not connect to Terragen.")
+                return
 
-load_dotenv()
+            def find_atmos():
+                atmos = tg.node_by_path("/Atmosphere 01") or tg.node_by_path("Atmosphere 01")
+                if atmos:
+                    return atmos
+                atmos_nodes = project.children_filtered_by_class("atmosphere")
+                return atmos_nodes[0] if atmos_nodes else None
 
-class TerrainApp(ctk.CTk):
-    def __init__(self):
-        super().__init__()
+            def link_to_atmosphere(cloud_node):
+                atmos = find_atmos()
+                if not atmos:
+                    self.log_message("Atmosphere node not found; cannot connect cloud.")
+                    return
+                link_params = ["cloud_shader", "clouds", "cloud_layer", "primary_cloud"]
+                for param in link_params:
+                    try:
+                        current = atmos.get_param_as_string(param)
+                    except Exception:
+                        continue
+                    if current != cloud_node.path():
+                        atmos.set_param(param, cloud_node.path())
+                        actual = atmos.get_param_as_string(param)
+                        self.log_message(f"Connected {cloud_node.name()} -> {atmos.name()} via '{param}' (set '{cloud_node.path()}', readback '{actual}')")
+                        return
+                self.log_message("Could not set cloud link on Atmosphere (no matching params).")
 
-        self.title("Terrain AI Generator")
-        self.geometry("1000x800")
+            # Gather existing cloud chain
+            existing = []
+            for cls in ("easy_cloud", "cloud_layer_v3"):
+                try:
+                    for c in project.children_filtered_by_class(cls):
+                        if c.name().startswith("AI_Cloud_Layer"):
+                            existing.append(c)
+                except Exception:
+                    pass
 
-        self.grid_columnconfigure(1, weight=1)
-        self.grid_rowconfigure(0, weight=1)
+            def suffix(n):
+                try:
+                    return int(n.split("_")[-1])
+                except Exception:
+                    return 0
 
-        self.sidebar_frame = ctk.CTkFrame(self, width=200, corner_radius=0)
-        self.sidebar_frame.grid(row=0, column=0, sticky="nsew")
-        self.sidebar_frame.grid_rowconfigure(4, weight=1)
+            existing.sort(key=lambda n: suffix(n.name()))
+            next_idx = suffix(existing[-1].name()) + 1 if existing else 1
+            name = f"AI_Cloud_Layer_{next_idx:02d}"
 
-        self.logo_label = ctk.CTkLabel(self.sidebar_frame, text="Terrain AI", font=ctk.CTkFont(size=20, weight="bold"))
-        self.logo_label.grid(row=0, column=0, padx=20, pady=(20, 10))
+            # Create new cloud node
+            node = tg.create_child(project, "easy_cloud")
+            if not node:
+                node = tg.create_child(project, "cloud_layer_v3")
+            if not node:
+                messagebox.showerror("Error", "Failed to create cloud node (Easy Cloud / Cloud Layer V3).")
+                return
 
-        self.upload_btn = ctk.CTkButton(self.sidebar_frame, text="Upload Reference Images", command=self.upload_images)
-        self.upload_btn.grid(row=1, column=0, padx=20, pady=10)
+            node.set_param("name", name)
 
-        self.gen_texture_var = ctk.BooleanVar(value=True)
-        self.gen_texture_chk = ctk.CTkCheckBox(self.sidebar_frame, text="Generate Texture", variable=self.gen_texture_var)
-        self.gen_texture_chk.grid(row=2, column=0, padx=20, pady=10)
+            # Chain to previous cloud if any
+            if existing:
+                prev = existing[-1]
+                for param in ("input_node", "main_input", "input"):
+                    try:
+                        node.set_param(param, prev.path())
+                        actual = node.get_param_as_string(param)
+                        self.log_message(f"Chained {name} -> {prev.name()} via '{param}' (set '{prev.path()}', readback '{actual}')")
+                        break
+                    except Exception:
+                        continue
+            else:
+                self.log_message("First cloud in chain; no previous cloud to link.")
 
-        self.gen_hf_btn = ctk.CTkButton(self.sidebar_frame, text="Generate Heightfield Images", fg_color="#800080", hover_color="#4b0082", command=self.start_heightfield_generation)
-        self.gen_hf_btn.grid(row=3, column=0, padx=20, pady=10)
-        self.gen_hf_btn.configure(state="disabled")
+            link_to_atmosphere(node)
+            self.log_message(f"Created Terragen cloud node: {node.path()}")
+            messagebox.showinfo("Success", f"Created cloud node: {node.name()}")
 
-        self.quit_btn = ctk.CTkButton(self.sidebar_frame, text="Quit", fg_color="red", hover_color="darkred", command=self.quit_app)
-        self.quit_btn.grid(row=7, column=0, padx=20, pady=10)
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to create cloud node: {e}")
+        self.sky_frame = ctk.CTkFrame(self.main_frame)
+        self.sky_frame.pack(fill="x", padx=20, pady=10)
 
-        self.footer_label = ctk.CTkLabel(self.sidebar_frame, text="Created by\nGeekatplay Studio", font=ctk.CTkFont(size=12))
-        self.footer_label.grid(row=8, column=0, padx=20, pady=(20, 0))
-        
-        self.youtube_btn = ctk.CTkButton(self.sidebar_frame, text="Tutorials: @geekatplay", fg_color="transparent", border_width=1, text_color=("gray10", "#DCE4EE"), command=self.open_youtube)
-        self.youtube_btn.grid(row=9, column=0, padx=20, pady=(5, 20))
+        ctk.CTkLabel(self.sky_frame, text="Sky and Clouds Reference", font=ctk.CTkFont(weight="bold")).pack(anchor="w", padx=10, pady=(10, 5))
 
-        self.main_frame = ctk.CTkScrollableFrame(self, corner_radius=0)
-        self.main_frame.grid(row=0, column=1, sticky="nsew")
+        btn_bar = ctk.CTkFrame(self.sky_frame, fg_color="transparent")
+        btn_bar.pack(fill="x", padx=10, pady=5)
 
-        self.image_paths = []
-        self.heightfield_path = None
-        self.last_result = None
-        self.api = TerrainGeneratorAPI()
+        self.upload_sky_btn = ctk.CTkButton(btn_bar, text="Upload Sky/Cloud Image", command=self.upload_sky_reference)
+        self.upload_sky_btn.pack(side="left", padx=5)
 
-        self.status_label = ctk.CTkLabel(self.main_frame, text="Upload reference images to start.")
-        self.status_label.pack(pady=10)
+        self.analyze_sky_btn = ctk.CTkButton(btn_bar, text="Analyze Atmosphere", fg_color="#0066cc", hover_color="#004b99", state="disabled", command=self.start_sky_analysis)
+        self.analyze_sky_btn.pack(side="left", padx=5)
 
-        self.log_textbox = ctk.CTkTextbox(self.main_frame, height=100)
-        self.log_textbox.pack(fill="x", padx=20, pady=5)
-        self.log_textbox.configure(state="disabled")
+        self.add_cloud_btn = ctk.CTkButton(btn_bar, text="Add Cloud Node in Terragen", fg_color="#228b22", hover_color="#176617", command=self.create_cloud_node)
+        self.add_cloud_btn.pack(side="left", padx=5)
 
-        self.images_frame = ctk.CTkFrame(self.main_frame)
-        self.images_frame.pack(fill="x", padx=20, pady=10)
+        self.sync_sun_btn = ctk.CTkButton(btn_bar, text="Sync Sunlight to Analysis", fg_color="#cc8800", hover_color="#a86d00", command=self.start_sync_sun)
+        self.sync_sun_btn.pack(side="left", padx=5)
 
-        self.results_frame = ctk.CTkFrame(self.main_frame)
-        self.results_frame.pack(fill="both", expand=True, padx=20, pady=10)
+        preview_bar = ctk.CTkFrame(self.sky_frame, fg_color="transparent")
+        preview_bar.pack(fill="x", padx=10, pady=5)
+
+        self.sky_preview_lbl = ctk.CTkLabel(preview_bar, text="No sky reference selected")
+        self.sky_preview_lbl.pack(side="left", padx=5)
+
+        self.sky_output = ctk.CTkTextbox(self.sky_frame, height=140)
+        self.sky_output.pack(fill="x", padx=10, pady=(5, 10))
+        self.sky_output.configure(state="disabled")
 
         # --- Manual Terragen Tools ---
         self.tools_frame = ctk.CTkFrame(self.main_frame)
@@ -481,6 +527,175 @@ class TerrainApp(ctk.CTk):
         self.log_textbox.see("end")
         self.log_textbox.configure(state="disabled")
         self.status_label.configure(text=message)
+
+    def upload_sky_reference(self):
+        filetypes = (("Image files", "*.jpg *.jpeg *.png"), ("All files", "*.*"))
+        filename = filedialog.askopenfilename(title="Select Sky/Cloud Reference", filetypes=filetypes)
+        if filename:
+            self.sky_image_path = filename
+            self.analyze_sky_btn.configure(state="normal")
+            self.log_message(f"Sky reference: {os.path.basename(filename)}")
+
+            try:
+                img = Image.open(filename)
+                img.thumbnail((160, 160))
+                self.sky_preview_img = ctk.CTkImage(light_image=img, dark_image=img, size=img.size)
+                self.sky_preview_lbl.configure(image=self.sky_preview_img, text="")
+            except Exception as e:
+                print(f"Error previewing sky reference: {e}")
+
+    def start_sky_analysis(self):
+        if not self.sky_image_path:
+            messagebox.showwarning("Warning", "Please select a sky/cloud reference image first.")
+            return
+        self.analyze_sky_btn.configure(state="disabled")
+        self.log_message("Analyzing sky reference...")
+        thread = threading.Thread(target=self.process_sky_analysis)
+        thread.start()
+
+    def process_sky_analysis(self):
+        try:
+            callback = lambda msg: self.after(0, self.log_message, msg)
+            result = self.api.analyze_atmosphere(self.sky_image_path, status_callback=callback)
+
+            def update_ui():
+                self.sky_output.configure(state="normal")
+                self.sky_output.delete("1.0", "end")
+                self.sky_output.insert("end", result)
+                self.sky_output.configure(state="disabled")
+                self.log_message("Sky analysis complete.")
+                self.analyze_sky_btn.configure(state="normal")
+
+            self.after(0, update_ui)
+
+        except Exception as e:
+            self.after(0, self.show_error, str(e))
+            self.after(0, lambda: self.analyze_sky_btn.configure(state="normal"))
+
+    def create_cloud_node(self):
+        try:
+            import terragen_rpc as tg
+            project = tg.root()
+            if not project:
+                messagebox.showerror("Error", "Could not connect to Terragen.")
+                return
+
+            name = "AI_Cloud_Layer"
+            # Helper: connect cloud to Atmosphere node
+            def connect_to_atmosphere(cloud_node):
+                try:
+                    atmos = tg.node_by_path("/Atmosphere 01") or tg.node_by_path("Atmosphere 01")
+                    if not atmos:
+                        # fallback by class
+                        atmos_nodes = project.children_filtered_by_class("atmosphere")
+                        if atmos_nodes:
+                            atmos = atmos_nodes[0]
+                    if not atmos:
+                        self.log_message("Atmosphere node not found; cannot connect cloud.")
+                        return
+
+                    # Attempt common parameter names for cloud attachment
+                    candidates = ["cloud_shader", "clouds", "cloud_layer", "primary_cloud"]
+                    for param in candidates:
+                        try:
+                            current = atmos.get_param_as_string(param)
+                        except Exception:
+                            continue
+
+                        if current != cloud_node.path():
+                            atmos.set_param(param, cloud_node.path())
+                            actual = atmos.get_param_as_string(param)
+                            self.log_message(f"Connected {cloud_node.name()} -> {atmos.name()} via '{param}' (set '{cloud_node.path()}', readback '{actual}')")
+                            return
+                    self.log_message("Could not set cloud link on Atmosphere (no matching params).")
+                except Exception as e:
+                    self.log_message(f"Failed to connect cloud to Atmosphere: {e}")
+
+            # Try to find existing
+            node = tg.node_by_path(f"/{name}")
+            if not node:
+                # Search by class for partial matches
+                candidates = project.children_filtered_by_class("easy_cloud")
+                for c in candidates:
+                    if c.name().startswith(name):
+                        node = c
+                        break
+
+            if node:
+                self.log_message(f"Cloud node already exists: {node.path()}")
+                connect_to_atmosphere(node)
+                messagebox.showinfo("Info", f"Cloud node already exists: {node.name()}")
+                return
+
+            # Try creating Easy Cloud; fallback to Cloud Layer V3
+            node = tg.create_child(project, "easy_cloud")
+            if not node:
+                node = tg.create_child(project, "cloud_layer_v3")
+
+            if not node:
+                messagebox.showerror("Error", "Failed to create cloud node (Easy Cloud / Cloud Layer V3).")
+                return
+
+            node.set_param("name", name)
+            self.log_message(f"Created Terragen cloud node: {node.path()}")
+            connect_to_atmosphere(node)
+            messagebox.showinfo("Success", f"Created cloud node: {node.name()}")
+
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to create cloud node: {e}")
+
+    def start_sync_sun(self):
+        if not self.sky_image_path:
+            messagebox.showwarning("Warning", "Please select a sky/cloud reference image first.")
+            return
+        self.sync_sun_btn.configure(state="disabled")
+        self.log_message("Syncing sun position to Terragen...")
+        thread = threading.Thread(target=self.process_sync_sun)
+        thread.start()
+
+    def process_sync_sun(self):
+        try:
+            callback = lambda msg: self.after(0, self.log_message, msg)
+            angles = self.api.analyze_sun_angles(self.sky_image_path, status_callback=callback)
+
+            az = angles.get("sun_azimuth_deg")
+            el = angles.get("sun_elevation_deg")
+            if az is None or el is None:
+                raise Exception("Sun analysis did not return azimuth/elevation.")
+
+            # Apply to Terragen
+            def apply():
+                try:
+                    import terragen_rpc as tg
+                    project = tg.root()
+                    if not project:
+                        raise Exception("Could not connect to Terragen.")
+
+                    # Find Sunlight node
+                    sun = tg.node_by_path("/Sunlight 01") or tg.node_by_path("Sunlight 01")
+                    if not sun:
+                        # Search by class
+                        suns = project.children_filtered_by_class("sunlight")
+                        if suns:
+                            sun = suns[0]
+
+                    if not sun:
+                        raise Exception("Sunlight node not found in Terragen.")
+
+                    sun.set_param("heading", float(az))
+                    sun.set_param("elevation", float(el))
+                    self.log_message(f"Set Sunlight heading={az:.1f}°, elevation={el:.1f}°")
+                    messagebox.showinfo("Success", f"Sunlight updated to heading {az:.1f}°, elevation {el:.1f}°")
+                except Exception as e:
+                    messagebox.showerror("Error", f"Failed to update Sunlight: {e}")
+                finally:
+                    self.sync_sun_btn.configure(state="normal")
+
+            self.after(0, apply)
+
+        except Exception as e:
+            self.after(0, self.show_error, str(e))
+            self.after(0, lambda: self.sync_sun_btn.configure(state="normal"))
 
     def upload_images(self):
         filetypes = (("Image files", "*.jpg *.jpeg *.png"), ("All files", "*.*"))
