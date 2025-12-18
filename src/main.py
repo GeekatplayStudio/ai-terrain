@@ -2,91 +2,77 @@ import customtkinter as ctk
 from tkinter import filedialog, messagebox
 from PIL import Image
 import os
-import sys
 import threading
-    def create_cloud_node(self):
-        try:
-            import terragen_rpc as tg
-            project = tg.root()
-            if not project:
-                messagebox.showerror("Error", "Could not connect to Terragen.")
-                return
+import webbrowser
+from datetime import datetime
+from dotenv import load_dotenv
+from api_handler import TerrainGeneratorAPI
 
-            def find_atmos():
-                atmos = tg.node_by_path("/Atmosphere 01") or tg.node_by_path("Atmosphere 01")
-                if atmos:
-                    return atmos
-                atmos_nodes = project.children_filtered_by_class("atmosphere")
-                return atmos_nodes[0] if atmos_nodes else None
+load_dotenv()
 
-            def link_to_atmosphere(cloud_node):
-                atmos = find_atmos()
-                if not atmos:
-                    self.log_message("Atmosphere node not found; cannot connect cloud.")
-                    return
-                link_params = ["cloud_shader", "clouds", "cloud_layer", "primary_cloud"]
-                for param in link_params:
-                    try:
-                        current = atmos.get_param_as_string(param)
-                    except Exception:
-                        continue
-                    if current != cloud_node.path():
-                        atmos.set_param(param, cloud_node.path())
-                        actual = atmos.get_param_as_string(param)
-                        self.log_message(f"Connected {cloud_node.name()} -> {atmos.name()} via '{param}' (set '{cloud_node.path()}', readback '{actual}')")
-                        return
-                self.log_message("Could not set cloud link on Atmosphere (no matching params).")
 
-            # Gather existing cloud chain
-            existing = []
-            for cls in ("easy_cloud", "cloud_layer_v3"):
-                try:
-                    for c in project.children_filtered_by_class(cls):
-                        if c.name().startswith("AI_Cloud_Layer"):
-                            existing.append(c)
-                except Exception:
-                    pass
+class TerrainApp(ctk.CTk):
+    def __init__(self):
+        super().__init__()
 
-            def suffix(n):
-                try:
-                    return int(n.split("_")[-1])
-                except Exception:
-                    return 0
+        self.title("Terrain AI Generator")
+        self.geometry("1000x800")
 
-            existing.sort(key=lambda n: suffix(n.name()))
-            next_idx = suffix(existing[-1].name()) + 1 if existing else 1
-            name = f"AI_Cloud_Layer_{next_idx:02d}"
+        self.grid_columnconfigure(1, weight=1)
+        self.grid_rowconfigure(0, weight=1)
 
-            # Create new cloud node
-            node = tg.create_child(project, "easy_cloud")
-            if not node:
-                node = tg.create_child(project, "cloud_layer_v3")
-            if not node:
-                messagebox.showerror("Error", "Failed to create cloud node (Easy Cloud / Cloud Layer V3).")
-                return
+        self.sidebar_frame = ctk.CTkFrame(self, width=200, corner_radius=0)
+        self.sidebar_frame.grid(row=0, column=0, sticky="nsew")
+        self.sidebar_frame.grid_rowconfigure(4, weight=1)
 
-            node.set_param("name", name)
+        self.logo_label = ctk.CTkLabel(self.sidebar_frame, text="Terrain AI", font=ctk.CTkFont(size=20, weight="bold"))
+        self.logo_label.grid(row=0, column=0, padx=20, pady=(20, 10))
 
-            # Chain to previous cloud if any
-            if existing:
-                prev = existing[-1]
-                for param in ("input_node", "main_input", "input"):
-                    try:
-                        node.set_param(param, prev.path())
-                        actual = node.get_param_as_string(param)
-                        self.log_message(f"Chained {name} -> {prev.name()} via '{param}' (set '{prev.path()}', readback '{actual}')")
-                        break
-                    except Exception:
-                        continue
-            else:
-                self.log_message("First cloud in chain; no previous cloud to link.")
+        self.upload_btn = ctk.CTkButton(self.sidebar_frame, text="Upload Reference Images", command=self.upload_images)
+        self.upload_btn.grid(row=1, column=0, padx=20, pady=10)
 
-            link_to_atmosphere(node)
-            self.log_message(f"Created Terragen cloud node: {node.path()}")
-            messagebox.showinfo("Success", f"Created cloud node: {node.name()}")
+        self.gen_texture_var = ctk.BooleanVar(value=True)
+        self.gen_texture_chk = ctk.CTkCheckBox(self.sidebar_frame, text="Generate Texture", variable=self.gen_texture_var)
+        self.gen_texture_chk.grid(row=2, column=0, padx=20, pady=10)
 
-        except Exception as e:
-            messagebox.showerror("Error", f"Failed to create cloud node: {e}")
+        self.gen_hf_btn = ctk.CTkButton(self.sidebar_frame, text="Generate Heightfield Images", fg_color="#800080", hover_color="#4b0082", command=self.start_heightfield_generation)
+        self.gen_hf_btn.grid(row=3, column=0, padx=20, pady=10)
+        self.gen_hf_btn.configure(state="disabled")
+
+        self.quit_btn = ctk.CTkButton(self.sidebar_frame, text="Quit", fg_color="red", hover_color="darkred", command=self.quit_app)
+        self.quit_btn.grid(row=7, column=0, padx=20, pady=10)
+
+        self.footer_label = ctk.CTkLabel(self.sidebar_frame, text="Created by\nGeekatplay Studio", font=ctk.CTkFont(size=12))
+        self.footer_label.grid(row=8, column=0, padx=20, pady=(20, 0))
+        
+        self.youtube_btn = ctk.CTkButton(self.sidebar_frame, text="Tutorials: @geekatplay", fg_color="transparent", border_width=1, text_color=("gray10", "#DCE4EE"), command=self.open_youtube)
+        self.youtube_btn.grid(row=9, column=0, padx=20, pady=(5, 20))
+
+        self.main_frame = ctk.CTkScrollableFrame(self, corner_radius=0)
+        self.main_frame.grid(row=0, column=1, sticky="nsew")
+
+        self.image_paths = []
+        self.heightfield_path = None
+        self.generated_texture_path = None
+        self.last_result = None
+        self.sky_image_path = None
+        self.sky_preview_img = None
+        self.api = TerrainGeneratorAPI()
+
+        self.status_label = ctk.CTkLabel(self.main_frame, text="Upload reference images to start.")
+        self.status_label.pack(pady=10)
+
+        self.log_textbox = ctk.CTkTextbox(self.main_frame, height=100)
+        self.log_textbox.pack(fill="x", padx=20, pady=5)
+        self.log_textbox.configure(state="disabled")
+
+        self.images_frame = ctk.CTkFrame(self.main_frame)
+        self.images_frame.pack(fill="x", padx=20, pady=10)
+
+        self.results_frame = ctk.CTkFrame(self.main_frame)
+        self.results_frame.pack(fill="both", expand=True, padx=20, pady=10)
+
+        # --- Sky / Atmosphere Analysis ---
         self.sky_frame = ctk.CTkFrame(self.main_frame)
         self.sky_frame.pack(fill="x", padx=20, pady=10)
 
@@ -123,7 +109,6 @@ import threading
         
         ctk.CTkLabel(self.tools_frame, text="Terragen Integration", font=ctk.CTkFont(weight="bold")).pack(anchor="w", padx=10, pady=5)
         
-        # Source Selector
         self.source_selector = ctk.CTkSegmentedButton(self.tools_frame, values=["Manual Files", "Generated Result", "Uploaded Images"])
         self.source_selector.pack(fill="x", padx=10, pady=5)
         self.source_selector.set("Manual Files")
@@ -142,16 +127,12 @@ import threading
         
         self.send_tg_btn = ctk.CTkButton(btn_frame, text="Send to Terragen", fg_color="green", command=self.send_to_terragen)
         self.send_tg_btn.pack(side="left", padx=5)
-        # self.send_tg_btn.configure(state="disabled") # Enable by default, validate on click
 
-        # --- Debug Tools ---
         debug_frame = ctk.CTkFrame(self.tools_frame, fg_color="transparent")
         debug_frame.pack(fill="x", padx=10, pady=5)
         
         ctk.CTkButton(debug_frame, text="Read Node Structure", command=self.read_node_structure).pack(side="left", padx=5)
-        # Removed "Add Fractal & Nodes" as it is now integrated into Send to Terragen
 
-        # Preview Frame for Manual Tools
         self.manual_preview_frame = ctk.CTkFrame(self.tools_frame, fg_color="transparent")
         self.manual_preview_frame.pack(fill="x", padx=10, pady=5)
         
@@ -166,20 +147,19 @@ import threading
             import terragen_rpc as tg
             try:
                 project = tg.root()
-                if not project: raise Exception("No project")
-            except:
+                if not project:
+                    raise Exception("No project")
+            except Exception:
                 messagebox.showerror("Error", "Could not connect to Terragen.")
                 return
 
             self.log_message("--- Reading Terragen Node Structure ---")
             
-            # List children of root
             children = project.children()
             self.log_message(f"Root Children ({len(children)}):")
             for child in children:
-                self.log_message(f" - {child.name()} ({child.path()}) [Class: {child.path().split('/')[-1]}]") # Class isn't directly available, guessing from path/name
+                self.log_message(f" - {child.name()} ({child.path()}) [Class: {child.path().split('/')[-1]}]")
 
-            # Inspect Planet 01
             planet = tg.node_by_path("/Planet 01")
             if planet:
                 self.log_message("\n--- Planet 01 Details ---")
@@ -188,7 +168,6 @@ import threading
             else:
                 self.log_message("\nWARNING: Planet 01 not found!")
 
-            # Inspect Compute Terrain
             ct = tg.node_by_path("/Compute Terrain")
             if ct:
                 self.log_message("\n--- Compute Terrain Details ---")
@@ -206,45 +185,39 @@ import threading
         try:
             import terragen_rpc as tg
             project = tg.root()
-            if not project: 
+            if not project:
                 messagebox.showerror("Error", "Not connected.")
                 return
 
             self.log_message(f"--- Deploying to Terragen (HF: {os.path.basename(hf_path) if hf_path else 'None'}, Tex: {os.path.basename(tex_path) if tex_path else 'None'}) ---")
 
-            # Helper to set and verify
             def set_and_verify(node, param, value, is_node=False):
                 val_to_set = value.path() if is_node else value
                 node.set_param(param, val_to_set)
                 actual = node.get_param_as_string(param)
                 self.log_message(f"Set {node.name()}.{param} = '{val_to_set}' | Readback: '{actual}'")
 
-            # 1. Find Key Nodes
             planet = tg.node_by_path("/Planet 01")
             if not planet:
-                planet = tg.node_by_path("Planet 01") # Try without slash
-            
+                planet = tg.node_by_path("Planet 01")
             if not planet:
                 planets = project.children_filtered_by_class("planet")
-                if planets: 
+                if planets:
                     planet = planets[0]
                     self.log_message(f"Found planet by class: {planet.path()}")
 
             compute_terrain = tg.node_by_path("/Compute Terrain")
             if not compute_terrain:
-                compute_terrain = tg.node_by_path("Compute Terrain") # Try without slash
-
+                compute_terrain = tg.node_by_path("Compute Terrain")
             if not compute_terrain:
                 cts = project.children_filtered_by_class("compute_terrain")
-                if cts: 
+                if cts:
                     compute_terrain = cts[0]
                     self.log_message(f"Found Compute Terrain by class: {compute_terrain.path()}")
 
-            # If still not found, create it
             if not compute_terrain:
                 self.log_message("Compute Terrain not found. Attempting creation...")
                 try:
-                    # Create using generic create_child
                     new_node = tg.create_child(project, "compute_terrain")
                     if new_node:
                         new_node.set_param("name", "Compute Terrain")
@@ -255,7 +228,6 @@ import threading
                 except Exception as e:
                     self.log_message(f"Creation failed: {e}")
 
-            # Final check: Scan all children for name "Compute Terrain" just in case
             if not compute_terrain:
                 self.log_message("Scanning all root children for 'Compute Terrain'...")
                 try:
@@ -264,14 +236,16 @@ import threading
                             compute_terrain = c
                             self.log_message(f"Found Compute Terrain by name scan: {c.path()}")
                             break
-                except: pass
+                except Exception:
+                    pass
 
             if not planet:
                 self.log_message("CRITICAL: Planet node not found. Listing all nodes:")
                 try:
                     for c in project.children():
                         self.log_message(f" - {c.name()} ({c.path()})")
-                except: pass
+                except Exception:
+                    pass
                 messagebox.showerror("Error", "Could not find a Planet node. See log for available nodes.")
                 return
 
@@ -280,596 +254,297 @@ import threading
                 try:
                     for c in project.children():
                         self.log_message(f" - {c.name()} ({c.path()})")
-                except: pass
+                except Exception:
+                    pass
                 messagebox.showerror("Error", "Could not find Compute Terrain node. See log for available nodes.")
                 return
 
-            # Helper to find or create node
             def find_or_create(name, class_name):
-                # Try exact path first
                 node = tg.node_by_path(f"/{name}")
-                if node: return node, True # Node, Existed
-                
-                # Try searching by name in children
+                if node:
+                    return node, True
                 children = project.children_filtered_by_class(class_name)
                 for c in children:
                     if c.name() == name:
                         return c, True
-                
-                # Create new
                 node = tg.create_child(project, class_name)
                 if node:
                     node.set_param("name", name)
-                    return node, False # Node, Created
+                    return node, False
                 return None, False
 
-            # 2. Create/Update Heightfield Chain
-            hf_load, hf_load_existed = find_or_create("Manual_HF_Load", "heightfield_load")
+            hf_load, _ = find_or_create("Manual_HF_Load", "heightfield_load")
             if hf_path:
                 set_and_verify(hf_load, "filename", hf_path)
             
-            hf_shader, hf_shader_existed = find_or_create("Manual_HF_Shader", "heightfield_shader")
+            hf_shader, _ = find_or_create("Manual_HF_Shader", "heightfield_shader")
             set_and_verify(hf_shader, "heightfield", hf_load, is_node=True)
             
-            # Connect to Compute Terrain (Only if not already connected)
             current_ct_input = compute_terrain.get_param_as_string("input_node")
             if current_ct_input != hf_shader.path():
-                # Inject HF Shader
                 if current_ct_input and current_ct_input != hf_shader.path():
                     set_and_verify(hf_shader, "input_node", current_ct_input)
                     self.log_message(f"Chained HF Shader -> Old Terrain Source ({current_ct_input})")
-                
                 set_and_verify(compute_terrain, "input_node", hf_shader, is_node=True)
                 self.log_message("Connected Compute Terrain -> HF Shader")
             else:
-                self.log_message("Compute Terrain already connected to HF Shader.")
+                self.log_message("Compute Terrain already connected to HF Shader")
 
-            # 3. Create/Update Texture Chain
-            surf_layer = None
             if tex_path:
-                img_map, _ = find_or_create("Manual_Texture_Map", "image_map_shader")
-                set_and_verify(img_map, "image_filename", tex_path)
-
-                surf_layer, surf_layer_existed = find_or_create("Manual_Texture_Layer", "surface_layer")
-                set_and_verify(surf_layer, "colour_function", img_map, is_node=True)
-                self.log_message("Texture Nodes Ready")
+                surf_shader, _ = find_or_create("Manual_Surface", "default_shader")
+                set_and_verify(surf_shader, "input_node", compute_terrain, is_node=True)
+                set_and_verify(surf_shader, "color_function_input", tex_path)
+                set_and_verify(planet, "surface_shader", surf_shader, is_node=True)
+                self.log_message("Connected Planet surface -> Manual_Surface shader")
             else:
-                self.log_message("No texture selected.")
+                set_and_verify(planet, "surface_shader", compute_terrain, is_node=True)
+                self.log_message("Connected Planet surface -> Compute Terrain")
 
-            # 4. Create/Update Fractal
-            fractal, fractal_existed = find_or_create("Manual_Fractal", "power_fractal_shader_v3")
-            
-            # 5. Chain Surface Shaders
-            # Check if Planet is already connected to our chain
-            current_surf = planet.get_param_as_string("surface_shader")
-            
-            # Identify our top node
-            top_node = surf_layer if surf_layer else fractal
-            
-            # SAFETY: Break potential loops before connecting
-            # We want: Planet -> [Texture] -> Fractal -> [Previous]
-            # So Fractal should NEVER input from Texture.
-            if surf_layer and fractal:
-                fractal_input = fractal.get_param_as_string("input_node")
-                if fractal_input == surf_layer.path():
-                    self.log_message("Breaking loop: Disconnecting Fractal from Texture Layer")
-                    fractal.set_param("input_node", "") # Clear it temporarily
-
-            # If Planet is already pointing to our top node, we assume the chain is fine (or we just updated files)
-            if current_surf == top_node.path():
-                self.log_message("Planet already connected to our chain. Updates applied.")
-                
-                # Ensure internal chain (Texture -> Fractal) is correct if we have texture
-                if surf_layer:
-                     set_and_verify(surf_layer, "input_node", fractal, is_node=True)
-            else:
-                # New connection needed
-                self.log_message("Building new Surface Chain...")
-                
-                # Connect Fractal to whatever was previously on the planet
-                # But ensure we don't connect to ourselves
-                if current_surf:
-                    is_self = False
-                    if surf_layer and current_surf == surf_layer.path(): is_self = True
-                    if current_surf == fractal.path(): is_self = True
-                    
-                    if not is_self:
-                        set_and_verify(fractal, "input_node", current_surf)
-                        self.log_message(f"Chained Fractal -> Previous Surface ({current_surf})")
-                
-                # Connect Texture -> Fractal
-                if surf_layer:
-                    set_and_verify(surf_layer, "input_node", fractal, is_node=True)
-                
-                # Connect Planet -> Top Node
-                set_and_verify(planet, "surface_shader", top_node, is_node=True)
-                self.log_message(f"Connected Planet -> {top_node.name()}")
-
-            messagebox.showinfo("Success", "Terragen updated successfully!")
+            self.log_message("--- Deploy complete ---")
+            messagebox.showinfo("Success", "Files sent to Terragen.")
 
         except Exception as e:
-            messagebox.showerror("Error", f"Failed to create nodes: {e}")
+            messagebox.showerror("Error", f"Failed to send to Terragen: {e}")
 
-    def select_manual_hf(self):
-        filename = filedialog.askopenfilename(title="Select Heightfield", filetypes=[("Images", "*.png *.jpg *.tif *.exr")])
-        if filename:
-            self.manual_hf_path = filename
-            self.log_message(f"Manual HF: {os.path.basename(filename)}")
-            self.check_manual_ready()
-            
-            # Update Preview
-            try:
-                img = Image.open(filename)
-                img.thumbnail((100, 100))
-                ctk_img = ctk.CTkImage(light_image=img, dark_image=img, size=img.size)
-                self.hf_preview_lbl.configure(image=ctk_img, text="")
-            except Exception as e:
-                print(f"Error previewing HF: {e}")
+    def upload_images(self):
+        files = filedialog.askopenfilenames(title="Select Reference Images", filetypes=[("Image files", "*.png *.jpg *.jpeg *.webp")])
+        if files:
+            self.image_paths = list(files)
+            self.status_label.configure(text=f"Selected {len(files)} reference images.")
+            self.gen_hf_btn.configure(state="normal")
+            self.update_image_previews()
 
-            # Try to update Terragen immediately if node exists
-            try:
-                import terragen_rpc as tg
-                project = tg.root()
-                if project:
-                    # Look for our specific node name
-                    # Note: Terragen might rename duplicates (e.g. Manual_HF_Load_1), so this finds the first match or exact match
-                    # We'll try to find the one we likely created.
-                    # For now, let's search for "Manual_HF_Load"
-                    hf_load = tg.node_by_path("/Manual_HF_Load")
-                    if not hf_load:
-                        # Try searching children if path lookup fails (sometimes reliable)
-                        loads = project.children_filtered_by_class("heightfield_load")
-                        for node in loads:
-                            if node.name().startswith("Manual_HF_Load"):
-                                hf_load = node
-                                break
-                    
-                    if hf_load:
-                        hf_load.set_param("filename", filename)
-                        self.log_message(f"Updated Terragen node '{hf_load.name()}' with new file.")
-            except Exception as e:
-                print(f"Auto-update failed (Terragen might not be running): {e}")
+    def update_image_previews(self):
+        for widget in self.images_frame.winfo_children():
+            widget.destroy()
 
-    def select_manual_tex(self):
-        filename = filedialog.askopenfilename(title="Select Texture", filetypes=[("Images", "*.png *.jpg *.tif")])
-        if filename:
-            self.manual_tex_path = filename
-            self.log_message(f"Manual Texture: {os.path.basename(filename)}")
-            self.check_manual_ready()
-            
-            # Update Preview
-            try:
-                img = Image.open(filename)
-                img.thumbnail((100, 100))
-                ctk_img = ctk.CTkImage(light_image=img, dark_image=img, size=img.size)
-                self.tex_preview_lbl.configure(image=ctk_img, text="")
-            except Exception as e:
-                print(f"Error previewing Texture: {e}")
+        for idx, path in enumerate(self.image_paths):
+            img = ctk.CTkImage(light_image=Image.open(path), dark_image=Image.open(path), size=(150, 150))
+            label = ctk.CTkLabel(self.images_frame, image=img, text=f"Reference {idx + 1}")
+            label.image = img
+            label.pack(side="left", padx=10, pady=10)
 
-            # Try to update Terragen immediately if node exists
-            try:
-                import terragen_rpc as tg
-                project = tg.root()
-                if project:
-                    img_map = tg.node_by_path("/Manual_Texture_Map")
-                    if not img_map:
-                        maps = project.children_filtered_by_class("image_map_shader")
-                        for node in maps:
-                            if node.name().startswith("Manual_Texture_Map"):
-                                img_map = node
-                                break
-                    
-                    if img_map:
-                        img_map.set_param("image_filename", filename)
-                        self.log_message(f"Updated Terragen node '{img_map.name()}' with new file.")
-            except Exception as e:
-                print(f"Auto-update failed: {e}")
+    def start_heightfield_generation(self):
+        thread = threading.Thread(target=self.generate_heightfield)
+        thread.daemon = True
+        thread.start()
 
-    def check_manual_ready(self):
-        if self.manual_hf_path and self.manual_tex_path:
-            self.send_tg_btn.configure(state="normal")
+    def generate_heightfield(self):
+        if not self.image_paths:
+            messagebox.showerror("Error", "Please upload reference images first.")
+            return
 
-    def send_to_terragen(self):
-        mode = self.source_selector.get()
-        hf_path = None
-        tex_path = None
-        
-        if mode == "Manual Files":
-            hf_path = self.manual_hf_path
-            tex_path = self.manual_tex_path
-            if not hf_path and not tex_path:
-                messagebox.showwarning("Warning", "Please select at least a Heightfield or Texture file.")
-                return
+        self.status_label.configure(text="Generating heightfields and texture...")
+        self.log_message("Starting generation using uploaded reference images...")
 
-        elif mode == "Generated Result":
-            if not self.heightfield_path:
-                messagebox.showwarning("Warning", "No generated heightfield available. Please generate one first.")
-                return
-            hf_path = self.heightfield_path
-            
-            # Use generated texture if available
-            if hasattr(self, 'generated_texture_path') and self.generated_texture_path:
-                tex_path = self.generated_texture_path
-            else:
-                self.log_message("No generated texture found.")
+        try:
+            result = self.api.generate_heightfield(self.image_paths, self.gen_texture_var.get())
+            self.last_result = result
 
-        elif mode == "Uploaded Images":
-            # Use generated HF if available, else manual
-            if self.heightfield_path:
-                hf_path = self.heightfield_path
-            elif self.manual_hf_path:
-                hf_path = self.manual_hf_path
-            
-            if self.image_paths:
-                tex_path = self.image_paths[0]
-            else:
-                messagebox.showwarning("Warning", "No uploaded images found.")
-                return
+            self.heightfield_path = result.get("heightfield_path")
+            self.generated_texture_path = result.get("texture_path")
 
-        # Validate paths
-        if hf_path:
-            hf_path = os.path.abspath(hf_path)
-            if not os.path.exists(hf_path):
-                messagebox.showerror("Error", f"Heightfield file not found:\n{hf_path}")
-                return
-        
-        if tex_path:
-            tex_path = os.path.abspath(tex_path)
-            if not os.path.exists(tex_path):
-                messagebox.showerror("Error", f"Texture file not found:\n{tex_path}")
-                return
+            self.update_result_previews()
+            self.status_label.configure(text="Generation complete.")
+            self.log_message("Generation completed successfully.")
+        except Exception as e:
+            self.status_label.configure(text="Generation failed.")
+            messagebox.showerror("Error", f"Failed to generate heightfields: {e}")
+            self.log_message(f"Error during generation: {e}")
 
-        self.deploy_to_terragen(hf_path, tex_path)
+    def update_result_previews(self):
+        for widget in self.results_frame.winfo_children():
+            widget.destroy()
+
+        if self.heightfield_path:
+            img = ctk.CTkImage(light_image=Image.open(self.heightfield_path), dark_image=Image.open(self.heightfield_path), size=(300, 300))
+            label = ctk.CTkLabel(self.results_frame, image=img, text="Heightfield")
+            label.image = img
+            label.pack(side="left", padx=10, pady=10)
+
+        if self.generated_texture_path:
+            img = ctk.CTkImage(light_image=Image.open(self.generated_texture_path), dark_image=Image.open(self.generated_texture_path), size=(300, 300))
+            label = ctk.CTkLabel(self.results_frame, image=img, text="Texture")
+            label.image = img
+            label.pack(side="left", padx=10, pady=10)
 
     def log_message(self, message):
         self.log_textbox.configure(state="normal")
-        self.log_textbox.insert("end", message + "\n")
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        self.log_textbox.insert("end", f"[{timestamp}] {message}\n")
         self.log_textbox.see("end")
         self.log_textbox.configure(state="disabled")
-        self.status_label.configure(text=message)
+
+    def quit_app(self):
+        self.destroy()
+
+    def select_manual_hf(self):
+        path = filedialog.askopenfilename(title="Select Heightfield File", filetypes=[("Image files", "*.png *.exr *.tif *.tiff"), ("All files", "*.*")])
+        if path:
+            self.manual_hf_path = path
+            self.hf_preview_lbl.configure(text=os.path.basename(path))
+
+    def select_manual_tex(self):
+        path = filedialog.askopenfilename(title="Select Texture File", filetypes=[("Image files", "*.png *.jpg *.jpeg *.tif *.tiff"), ("All files", "*.*")])
+        if path:
+            self.manual_tex_path = path
+            self.tex_preview_lbl.configure(text=os.path.basename(path))
+
+    def send_to_terragen(self):
+        source = self.source_selector.get()
+        hf_path = None
+        tex_path = None
+
+        if source == "Manual Files":
+            hf_path = self.manual_hf_path
+            tex_path = self.manual_tex_path
+        elif source == "Generated Result" and self.last_result:
+            hf_path = self.heightfield_path
+            tex_path = self.generated_texture_path
+        elif source == "Uploaded Images" and self.image_paths:
+            hf_path = self.image_paths[0]
+            tex_path = self.image_paths[1] if len(self.image_paths) > 1 else None
+
+        if not hf_path:
+            messagebox.showerror("Error", "No heightfield selected or available.")
+            return
+
+        self.deploy_to_terragen(hf_path, tex_path)
 
     def upload_sky_reference(self):
-        filetypes = (("Image files", "*.jpg *.jpeg *.png"), ("All files", "*.*"))
-        filename = filedialog.askopenfilename(title="Select Sky/Cloud Reference", filetypes=filetypes)
-        if filename:
-            self.sky_image_path = filename
-            self.analyze_sky_btn.configure(state="normal")
-            self.log_message(f"Sky reference: {os.path.basename(filename)}")
-
-            try:
-                img = Image.open(filename)
-                img.thumbnail((160, 160))
-                self.sky_preview_img = ctk.CTkImage(light_image=img, dark_image=img, size=img.size)
-                self.sky_preview_lbl.configure(image=self.sky_preview_img, text="")
-            except Exception as e:
-                print(f"Error previewing sky reference: {e}")
+        path = filedialog.askopenfilename(title="Select Sky Image", filetypes=[("Image files", "*.png *.jpg *.jpeg *.webp")])
+        if not path:
+            return
+        self.sky_image_path = path
+        img = ctk.CTkImage(light_image=Image.open(path), dark_image=Image.open(path), size=(200, 120))
+        self.sky_preview_img = img
+        self.sky_preview_lbl.configure(text=os.path.basename(path), image=img, compound="top")
+        self.analyze_sky_btn.configure(state="normal")
 
     def start_sky_analysis(self):
         if not self.sky_image_path:
-            messagebox.showwarning("Warning", "Please select a sky/cloud reference image first.")
+            messagebox.showerror("Error", "Select a sky image first.")
             return
-        self.analyze_sky_btn.configure(state="disabled")
-        self.log_message("Analyzing sky reference...")
-        thread = threading.Thread(target=self.process_sky_analysis)
+        thread = threading.Thread(target=self.analyze_sky)
+        thread.daemon = True
         thread.start()
 
-    def process_sky_analysis(self):
+    def analyze_sky(self):
+        self.log_message("Analyzing atmosphere and clouds...")
         try:
-            callback = lambda msg: self.after(0, self.log_message, msg)
-            result = self.api.analyze_atmosphere(self.sky_image_path, status_callback=callback)
-
-            def update_ui():
-                self.sky_output.configure(state="normal")
-                self.sky_output.delete("1.0", "end")
-                self.sky_output.insert("end", result)
-                self.sky_output.configure(state="disabled")
-                self.log_message("Sky analysis complete.")
-                self.analyze_sky_btn.configure(state="normal")
-
-            self.after(0, update_ui)
-
+            summary = self.api.analyze_atmosphere(self.sky_image_path)
+            self.sky_output.configure(state="normal")
+            self.sky_output.delete("1.0", "end")
+            self.sky_output.insert("end", summary)
+            self.sky_output.configure(state="disabled")
+            self.log_message("Atmosphere analysis complete.")
         except Exception as e:
-            self.after(0, self.show_error, str(e))
-            self.after(0, lambda: self.analyze_sky_btn.configure(state="normal"))
+            messagebox.showerror("Error", f"Failed to analyze atmosphere: {e}")
+            self.log_message(f"Sky analysis failed: {e}")
 
     def create_cloud_node(self):
         try:
             import terragen_rpc as tg
             project = tg.root()
             if not project:
-                messagebox.showerror("Error", "Could not connect to Terragen.")
+                messagebox.showerror("Error", "Terragen not connected.")
                 return
 
-            name = "AI_Cloud_Layer"
-            # Helper: connect cloud to Atmosphere node
-            def connect_to_atmosphere(cloud_node):
-                try:
-                    atmos = tg.node_by_path("/Atmosphere 01") or tg.node_by_path("Atmosphere 01")
-                    if not atmos:
-                        # fallback by class
-                        atmos_nodes = project.children_filtered_by_class("atmosphere")
-                        if atmos_nodes:
-                            atmos = atmos_nodes[0]
-                    if not atmos:
-                        self.log_message("Atmosphere node not found; cannot connect cloud.")
-                        return
+            self.log_message("Creating or chaining cloud node to Atmosphere...")
 
-                    # Attempt common parameter names for cloud attachment
-                    candidates = ["cloud_shader", "clouds", "cloud_layer", "primary_cloud"]
-                    for param in candidates:
-                        try:
-                            current = atmos.get_param_as_string(param)
-                        except Exception:
-                            continue
-
-                        if current != cloud_node.path():
-                            atmos.set_param(param, cloud_node.path())
-                            actual = atmos.get_param_as_string(param)
-                            self.log_message(f"Connected {cloud_node.name()} -> {atmos.name()} via '{param}' (set '{cloud_node.path()}', readback '{actual}')")
-                            return
-                    self.log_message("Could not set cloud link on Atmosphere (no matching params).")
-                except Exception as e:
-                    self.log_message(f"Failed to connect cloud to Atmosphere: {e}")
-
-            # Try to find existing
-            node = tg.node_by_path(f"/{name}")
-            if not node:
-                # Search by class for partial matches
-                candidates = project.children_filtered_by_class("easy_cloud")
-                for c in candidates:
-                    if c.name().startswith(name):
-                        node = c
-                        break
-
-            if node:
-                self.log_message(f"Cloud node already exists: {node.path()}")
-                connect_to_atmosphere(node)
-                messagebox.showinfo("Info", f"Cloud node already exists: {node.name()}")
+            atmosphere = tg.node_by_path("/Atmosphere 01") or tg.node_by_path("Atmosphere 01")
+            if not atmosphere:
+                atmospheres = project.children_filtered_by_class("atmosphere")
+                atmosphere = atmospheres[0] if atmospheres else None
+            if not atmosphere:
+                messagebox.showerror("Error", "Atmosphere node not found.")
                 return
 
-            # Try creating Easy Cloud; fallback to Cloud Layer V3
-            node = tg.create_child(project, "easy_cloud")
-            if not node:
-                node = tg.create_child(project, "cloud_layer_v3")
+            clouds = project.children_filtered_by_class("cloud_layer")
+            base_name = "AI Cloud"
+            idx = 1
+            existing_names = {c.name() for c in clouds}
+            while f"{base_name} {idx}" in existing_names:
+                idx += 1
+            new_name = f"{base_name} {idx}"
 
-            if not node:
-                messagebox.showerror("Error", "Failed to create cloud node (Easy Cloud / Cloud Layer V3).")
+            new_cloud = tg.create_child(project, "cloud_layer")
+            if not new_cloud:
+                messagebox.showerror("Error", "Failed to create cloud layer.")
                 return
 
-            node.set_param("name", name)
-            self.log_message(f"Created Terragen cloud node: {node.path()}")
-            connect_to_atmosphere(node)
-            messagebox.showinfo("Success", f"Created cloud node: {node.name()}")
+            new_cloud.set_param("name", new_name)
+            new_cloud.set_param("cloud_depth", 3000)
+            new_cloud.set_param("cloud_altitude", 5000)
+
+            if clouds:
+                last_cloud = clouds[-1]
+                new_cloud.set_param("input_node", last_cloud.path())
+                self.log_message(f"Chained {new_name} to {last_cloud.name()}")
+            else:
+                new_cloud.set_param("input_node", atmosphere.path())
+                self.log_message(f"Attached {new_name} to Atmosphere 01")
+
+            atmosphere.set_param("input_node", new_cloud.path())
+            self.log_message(f"Linked Atmosphere input to {new_name}")
+            messagebox.showinfo("Success", f"Created cloud layer: {new_name}")
 
         except Exception as e:
             messagebox.showerror("Error", f"Failed to create cloud node: {e}")
+            self.log_message(f"Cloud node creation failed: {e}")
 
     def start_sync_sun(self):
         if not self.sky_image_path:
-            messagebox.showwarning("Warning", "Please select a sky/cloud reference image first.")
+            messagebox.showerror("Error", "Select a sky image first.")
             return
-        self.sync_sun_btn.configure(state="disabled")
-        self.log_message("Syncing sun position to Terragen...")
-        thread = threading.Thread(target=self.process_sync_sun)
+        thread = threading.Thread(target=self.sync_sun_from_image)
+        thread.daemon = True
         thread.start()
 
-    def process_sync_sun(self):
+    def sync_sun_from_image(self):
         try:
-            callback = lambda msg: self.after(0, self.log_message, msg)
-            angles = self.api.analyze_sun_angles(self.sky_image_path, status_callback=callback)
+            import terragen_rpc as tg
+            project = tg.root()
+            if not project:
+                messagebox.showerror("Error", "Terragen not connected.")
+                return
 
-            az = angles.get("sun_azimuth_deg")
-            el = angles.get("sun_elevation_deg")
-            if az is None or el is None:
-                raise Exception("Sun analysis did not return azimuth/elevation.")
+            self.log_message("Analyzing sun angles from sky image...")
+            sun_data = self.api.analyze_sun_angles(self.sky_image_path)
+            az = sun_data.get("azimuth")
+            el = sun_data.get("elevation")
+            self.log_message(f"Sun angles -> Azimuth: {az}, Elevation: {el}")
 
-            # Apply to Terragen
-            def apply():
-                try:
-                    import terragen_rpc as tg
-                    project = tg.root()
-                    if not project:
-                        raise Exception("Could not connect to Terragen.")
+            sun_node = tg.node_by_path("/Sunlight 01") or tg.node_by_path("Sunlight 01")
+            if not sun_node:
+                suns = project.children_filtered_by_class("sun")
+                sun_node = suns[0] if suns else None
+            if not sun_node:
+                messagebox.showerror("Error", "Sunlight node not found.")
+                return
 
-                    # Find Sunlight node
-                    sun = tg.node_by_path("/Sunlight 01") or tg.node_by_path("Sunlight 01")
-                    if not sun:
-                        # Search by class
-                        suns = project.children_filtered_by_class("sunlight")
-                        if suns:
-                            sun = suns[0]
+            if az is not None:
+                sun_node.set_param("heading", float(az))
+            if el is not None:
+                sun_node.set_param("elevation", float(el))
 
-                    if not sun:
-                        raise Exception("Sunlight node not found in Terragen.")
-
-                    sun.set_param("heading", float(az))
-                    sun.set_param("elevation", float(el))
-                    self.log_message(f"Set Sunlight heading={az:.1f}°, elevation={el:.1f}°")
-                    messagebox.showinfo("Success", f"Sunlight updated to heading {az:.1f}°, elevation {el:.1f}°")
-                except Exception as e:
-                    messagebox.showerror("Error", f"Failed to update Sunlight: {e}")
-                finally:
-                    self.sync_sun_btn.configure(state="normal")
-
-            self.after(0, apply)
-
+            self.log_message("Sunlight synced to analysis angles.")
+            messagebox.showinfo("Success", "Sunlight updated from sky analysis.")
         except Exception as e:
-            self.after(0, self.show_error, str(e))
-            self.after(0, lambda: self.sync_sun_btn.configure(state="normal"))
-
-    def upload_images(self):
-        filetypes = (("Image files", "*.jpg *.jpeg *.png"), ("All files", "*.*"))
-        filenames = filedialog.askopenfilenames(title="Select Reference Images", filetypes=filetypes)
-        if filenames:
-            self.image_paths = list(filenames)
-            self.display_uploaded_images()
-            self.gen_hf_btn.configure(state="normal")
-            self.log_message(f"{len(self.image_paths)} images selected.")
-
-    def display_uploaded_images(self):
-        for widget in self.images_frame.winfo_children():
-            widget.destroy()
-        
-        for i, img_path in enumerate(self.image_paths):
-            try:
-                # Container for image and close button
-                container = ctk.CTkFrame(self.images_frame, fg_color="transparent")
-                container.pack(side="left", padx=5, pady=5)
-
-                img = Image.open(img_path)
-                img.thumbnail((100, 100))
-                ctk_img = ctk.CTkImage(light_image=img, dark_image=img, size=(100, 100))
-                
-                # Image Label
-                label = ctk.CTkLabel(container, image=ctk_img, text="")
-                label.pack(side="top")
-                
-                # Remove Button (Tiny X)
-                remove_btn = ctk.CTkButton(container, text="✕", width=20, height=20, 
-                                         fg_color="#ff4444", hover_color="#cc0000",
-                                         font=ctk.CTkFont(size=10, weight="bold"),
-                                         command=lambda idx=i: self.remove_image(idx))
-                remove_btn.pack(side="top", pady=2)
-                
-            except Exception as e:
-                print(f"Error loading image {img_path}: {e}")
-
-    def remove_image(self, index):
-        if 0 <= index < len(self.image_paths):
-            removed = self.image_paths.pop(index)
-            self.log_message(f"Removed image: {os.path.basename(removed)}")
-            self.display_uploaded_images()
-            
-            # Update button states if list is empty
-            if not self.image_paths:
-                self.gen_hf_btn.configure(state="disabled")
-
-    def start_heightfield_generation(self):
-        self.log_message("Starting Heightfield Generation...")
-        self.gen_hf_btn.configure(state="disabled")
-        thread = threading.Thread(target=self.process_heightfield_generation)
-        thread.start()
-
-    def process_heightfield_generation(self):
-        try:
-            callback = lambda msg: self.after(0, self.log_message, msg)
-            
-            # Call API to generate images directly
-            generate_texture = self.gen_texture_var.get()
-            generated_images = self.api.generate_heightmap_images(self.image_paths, generate_texture=generate_texture, status_callback=callback)
-            
-            if not generated_images:
-                raise Exception("No images were generated by the AI.")
-
-            self.after(0, self.log_message, f"Received {len(generated_images)} images from AI.")
-            
-            # Create Output Directory
-            output_dir = "highfield_output"
-            if not os.path.exists(output_dir):
-                os.makedirs(output_dir)
-                self.after(0, self.log_message, f"Created output directory: {output_dir}")
-
-            # Save Images with Timestamp
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            
-            # Handle Single Image Response (Potential Side-by-Side)
-            final_images = []
-            if len(generated_images) == 1:
-                img = generated_images[0]
-                width, height = img.size
-                # If width is significantly larger than height (e.g., > 1.8 aspect ratio), assume side-by-side
-                if width > height * 1.5:
-                    self.after(0, self.log_message, "Detected side-by-side image. Splitting...")
-                    # Split into two
-                    half_width = width // 2
-                    hf_part = img.crop((0, 0, half_width, height))
-                    tex_part = img.crop((half_width, 0, width, height))
-                    final_images = [hf_part, tex_part]
-                else:
-                    final_images = [img]
-            else:
-                final_images = generated_images
-
-            # Save Heightmap
-            hf_img = final_images[0]
-            hf_filename = f"generated_heightmap_{timestamp}.png"
-            hf_path = os.path.abspath(os.path.join(output_dir, hf_filename))
-            hf_img.save(hf_path)
-            self.heightfield_path = hf_path
-            
-            tex_path = None
-            if len(final_images) > 1:
-                tex_img = final_images[1]
-                tex_filename = f"generated_texture_{timestamp}.png"
-                tex_path = os.path.abspath(os.path.join(output_dir, tex_filename))
-                tex_img.save(tex_path)
-                self.generated_texture_path = tex_path
-            else:
-                self.generated_texture_path = None
-
-            def update_ui():
-                self.log_message(f"Heightfield saved: {os.path.basename(hf_path)}")
-                if tex_path:
-                    self.log_message(f"Texture saved: {os.path.basename(tex_path)}")
-                
-                self.gen_hf_btn.configure(state="normal")
-                
-                # Clear previous results
-                for widget in self.results_frame.winfo_children():
-                    widget.destroy()
-
-                # Display Heightmap
-                try:
-                    img = hf_img.copy()
-                    img.thumbnail((300, 300))
-                    ctk_img = ctk.CTkImage(light_image=img, dark_image=img, size=img.size)
-                    
-                    hf_frame = ctk.CTkFrame(self.results_frame)
-                    hf_frame.pack(side="left", padx=10, pady=10)
-                    
-                    lbl = ctk.CTkLabel(hf_frame, text=f"Heightfield\n{os.path.basename(hf_path)}", font=ctk.CTkFont(weight="bold"))
-                    lbl.pack(pady=5)
-                    
-                    img_lbl = ctk.CTkLabel(hf_frame, image=ctk_img, text="")
-                    img_lbl.pack(pady=10)
-                except Exception as e:
-                    print(f"Error displaying heightmap: {e}")
-
-                # Display Texture
-                if tex_path:
-                    try:
-                        img = Image.open(tex_path)
-                        img.thumbnail((300, 300))
-                        ctk_img = ctk.CTkImage(light_image=img, dark_image=img, size=img.size)
-                        
-                        tex_frame = ctk.CTkFrame(self.results_frame)
-                        tex_frame.pack(side="left", padx=10, pady=10)
-                        
-                        lbl = ctk.CTkLabel(tex_frame, text=f"Texture\n{os.path.basename(tex_path)}", font=ctk.CTkFont(weight="bold"))
-                        lbl.pack(pady=5)
-                        
-                        img_lbl = ctk.CTkLabel(tex_frame, image=ctk_img, text="")
-                        img_lbl.pack(pady=10)
-                    except Exception as e:
-                        print(f"Error displaying texture: {e}")
-
-            self.after(0, update_ui)
-
-        except Exception as e:
-            self.after(0, self.show_error, str(e))
-            self.after(0, lambda: self.gen_hf_btn.configure(state="normal"))
-
-    def show_error(self, message):
-        self.status_label.configure(text="Error occurred.")
-        messagebox.showerror("Error", message)
-
-    def quit_app(self):
-        self.destroy()
+            messagebox.showerror("Error", f"Failed to sync sun: {e}")
+            self.log_message(f"Sun sync failed: {e}")
 
     def open_youtube(self):
-        webbrowser.open("https://www.youtube.com/@geekatplay")
+        webbrowser.open("https://youtube.com/@geekatplay")
 
-if __name__ == "__main__":
-    ctk.set_appearance_mode("Dark")
+
+def main():
+    ctk.set_appearance_mode("dark")
+    ctk.set_default_color_theme("blue")
+
     app = TerrainApp()
     app.mainloop()
+
+
+if __name__ == "__main__":
+    main()
