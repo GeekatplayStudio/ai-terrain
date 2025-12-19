@@ -7,3 +7,13 @@ generate_hf.py
 reproduce_issue.py
 test_api.py
 dummy.jpg
+
+# Build artifacts
+dist/
+build/
+*.spec
+
+# Outputs
+outputs/
+highfield_output/
+*.png
