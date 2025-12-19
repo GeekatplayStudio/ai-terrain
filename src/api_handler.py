@@ -239,11 +239,40 @@ class TerrainGeneratorAPI:
             raise ValueError("Invalid sky reference image.")
 
         prompt = """
-        You are an expert Terragen TD. Analyze the attached sky/cloud reference and describe settings to recreate the atmosphere in Terragen.
-        - Time: time of day; Sun: azimuth (deg), elevation (deg), color temperature (K), overall light tint.
-        - Clouds: list each layer with type (e.g., cumulus, stratocumulus, cirrus, altocumulus), coverage %, density/softness, base altitude km, top altitude km, notable features (anvils, wisps, towering, flat deck).
-        - Atmosphere: horizon haze/turbidity, ambient light level, aerial perspective strength, visibility km, color casts or weather hints (clear, stormy, overcast, sunset).
-        - Output concise bullet points; no JSON; keep under 120 words; no image generation instructions.
+        You are an expert Terragen TD. Analyze the attached sky/cloud reference and return **concise JSON only** describing the atmosphere and clouds. 
+        Provide specific Terragen 4 parameter values where possible.
+        Schema:
+        {
+          "sun": {
+            "azimuth_deg": number, 
+            "elevation_deg": number
+          },
+          "cloud_layers": [
+            {
+              "type": "cumulus|stratocumulus|cirrus|altocumulus|altostratus|cumulonimbus|nimbus|fog|haze|other",
+              "coverage_pct": number,
+              "density": "low|medium|high",
+              "softness": "soft|medium|crisp",
+              "base_alt_km": number,
+              "top_alt_km": number,
+              "thickness_m": number,
+              "notes": "short free text"
+            }
+          ],
+          "atmosphere": {
+            "haze": "low|medium|high",
+            "visibility_km": number,
+            "tint": "short color hint",
+            "light_level": "low|medium|high",
+            "terragen_params": {
+                "haze_density": number (0.0-10.0, default ~2.0),
+                "bluesky_density": number (0.0-10.0, default ~2.0),
+                "bluesky_horizon_colour": "R G B" (e.g. "0.2 0.4 0.6"),
+                "haze_horizon_colour": "R G B" (e.g. "0.5 0.5 0.5")
+            }
+          }
+        }
+        Keep under 120 words; return valid JSON only, no extra text.
         """
 
         parts = [payload, {"text": prompt}]
