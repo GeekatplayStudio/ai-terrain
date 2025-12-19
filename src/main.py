@@ -192,10 +192,57 @@ class TerrainApp(ctk.CTk):
             self.log_message(f"--- Deploying to Terragen (HF: {os.path.basename(hf_path) if hf_path else 'None'}, Tex: {os.path.basename(tex_path) if tex_path else 'None'}) ---")
 
             def set_and_verify(node, param, value, is_node=False):
+                """Set a parameter and log the readback; return readback string."""
                 val_to_set = value.path() if is_node else value
                 node.set_param(param, val_to_set)
                 actual = node.get_param_as_string(param)
                 self.log_message(f"Set {node.name()}.{param} = '{val_to_set}' | Readback: '{actual}'")
+                return actual
+
+            def set_first_param(node, params, value, is_node=False):
+                """Try a list of parameter names; stop at first that reads back non-empty/matching."""
+                val_target = value.path() if is_node else value
+                for p in params:
+                    try:
+                        actual = set_and_verify(node, p, value, is_node=is_node)
+                        if actual and (actual == val_target or actual.lower() == str(val_target).lower()):
+                            return p, actual
+                    except Exception as e:
+                        self.log_message(f"Param attempt failed {node.name()}.{p}: {e}")
+                return None, None
+
+            def get_first_param(node, params):
+                """Read parameters in order and return the first non-empty value."""
+                for p in params:
+                    try:
+                        val = node.get_param_as_string(p)
+                        if val:
+                            return p, val
+                    except Exception as e:
+                        self.log_message(f"Read attempt failed {node.name()}.{p}: {e}")
+                return None, None
+
+            def dump_params(node, label):
+                """Attempt to list parameter names/values for debugging across Terragen builds."""
+                try:
+                    self.log_message(f"--- Params for {label} ({node.name()}) ---")
+                    # Try common introspection methods
+                    for attr in ("params", "parameters", "param_names", "list_params", "keys"):
+                        try:
+                            fn = getattr(node, attr, None)
+                            if callable(fn):
+                                vals = fn()
+                                self.log_message(f"{attr}(): {vals}")
+                        except Exception as e:
+                            self.log_message(f"{label} {attr}() failed: {e}")
+                    # Try dir-based guessing
+                    try:
+                        possible = [d for d in dir(node) if "param" in d.lower()]
+                        self.log_message(f"param-like attrs: {possible}")
+                    except Exception:
+                        pass
+                except Exception as e:
+                    self.log_message(f"Failed to dump params for {label}: {e}")
 
             planet = tg.node_by_path("/Planet 01")
             if not planet:
@@ -259,25 +306,35 @@ class TerrainApp(ctk.CTk):
                 messagebox.showerror("Error", "Could not find Compute Terrain node. See log for available nodes.")
                 return
 
-            def find_or_create(name, class_name):
+            def find_or_create(name, class_names):
+                """Locate node by name, then by acceptable class list; create using first class that works."""
                 node = tg.node_by_path(f"/{name}")
                 if node:
                     return node, True
-                children = project.children_filtered_by_class(class_name)
-                for c in children:
-                    if c.name() == name:
-                        return c, True
-                node = tg.create_child(project, class_name)
-                if node:
-                    node.set_param("name", name)
-                    return node, False
+
+                # Look for any node with matching name among allowed classes
+                for cls in class_names:
+                    for c in project.children_filtered_by_class(cls):
+                        if c.name() == name:
+                            return c, True
+
+                # Try to create using first working class
+                for cls in class_names:
+                    try:
+                        node = tg.create_child(project, cls)
+                        if node:
+                            node.set_param("name", name)
+                            self.log_message(f"Created '{name}' using class '{cls}'")
+                            return node, False
+                    except Exception as create_err:
+                        self.log_message(f"Create attempt failed for {name} class '{cls}': {create_err}")
                 return None, False
 
-            hf_load, _ = find_or_create("Manual_HF_Load", "heightfield_load")
+            hf_load, _ = find_or_create("Manual_HF_Load", ["heightfield_load"])
             if hf_path:
                 set_and_verify(hf_load, "filename", hf_path)
             
-            hf_shader, _ = find_or_create("Manual_HF_Shader", "heightfield_shader")
+            hf_shader, _ = find_or_create("Manual_HF_Shader", ["heightfield_shader"])
             set_and_verify(hf_shader, "heightfield", hf_load, is_node=True)
             
             current_ct_input = compute_terrain.get_param_as_string("input_node")
@@ -291,11 +348,84 @@ class TerrainApp(ctk.CTk):
                 self.log_message("Compute Terrain already connected to HF Shader")
 
             if tex_path:
-                surf_shader, _ = find_or_create("Manual_Surface", "default_shader")
+                surf_shader, _ = find_or_create("Manual_Surface", ["default_shader", "fractal_shader", "surface_layer"])
                 set_and_verify(surf_shader, "input_node", compute_terrain, is_node=True)
-                set_and_verify(surf_shader, "color_function_input", tex_path)
+
+                # Create or reuse an image map shader to feed the texture into the surface shader
+                tex_shader, _ = find_or_create("AI_Texture_Image", ["image_map_shader", "image_map_shader_v2", "image_map", "image_map_v3"])
+                # Try multiple filename params (covering US/UK spellings and legacy names)
+                filename_params = [
+                    "image_filename",
+                    "filename",
+                    "texture_filename",
+                    "file",
+                    "map_filename",
+                    "colour_image",
+                    "color_image",
+                ]
+                used_file_param, file_readback = set_first_param(tex_shader, filename_params, tex_path, is_node=False)
+                self.log_message(
+                    f"Texture file set result -> param: {used_file_param or 'none'}, readback: {file_readback or 'empty'}"
+                )
+
+                # Attempt to force full-coverage planar projection aligned to the heightfield domain
+                projection_params = ["projection", "mapping_mode", "map_projection", "mapping"]
+                set_first_param(tex_shader, projection_params, "Plan Y", is_node=False)
+
+                # Use ~10km domain to match heightfield load (1023px over 10,000m)
+                domain_size = "10000 10000 10000"
+                size_params = ["size", "map_size", "tile_size", "scale", "repeat_scale", "texture_size"]
+                set_first_param(tex_shader, size_params, domain_size, is_node=False)
+
+                size_xy_params = [
+                    ("size_x", "10000"),
+                    ("size_y", "10000"),
+                    ("size_z", "10000"),
+                    ("repeat_x", "1"),
+                    ("repeat_y", "1"),
+                ]
+                for p, v in size_xy_params:
+                    set_first_param(tex_shader, [p], v, is_node=False)
+
+                center_params = ["position_center", "center", "map_center", "offset", "origin"]
+                set_first_param(tex_shader, center_params, "0 0 0", is_node=False)
+
+                # Disable tiling/repeat if such toggles exist
+                repeat_flags = ["tile", "tiling", "repeat", "wrap", "use_repeat", "repeat_enabled"]
+                set_first_param(tex_shader, repeat_flags, "0", is_node=False)
+
+                # Try multiple possible color input params across Terragen variants
+                color_params = [
+                    "color_function_input",
+                    "color_function",
+                    "colour_function_input",
+                    "colour_function",
+                    "color_input",
+                    "colour_input",
+                    "surface_shader_input",
+                    "shader_input",
+                    "input_node",
+                ]
+                used_param, readback = set_first_param(surf_shader, color_params, tex_shader, is_node=True)
+                self.log_message(
+                    f"Texture wiring result -> param: {used_param or 'none'}, readback: {readback or 'empty'}"
+                )
+
+                # Verify downstream connections after wiring
+                _, tex_read = get_first_param(surf_shader, color_params)
+                self.log_message(f"Post-check surface color input reads as: {tex_read or 'empty'}")
+                surf_input_param, surf_input_val = get_first_param(planet, ["surface_shader", "surface_shader_input"])
+                self.log_message(f"Post-check planet surface input ({surf_input_param or 'n/a'}) = {surf_input_val or 'empty'}")
+                ct_input_param, ct_input_val = get_first_param(compute_terrain, ["input_node"])
+                self.log_message(f"Post-check compute terrain input ({ct_input_param or 'n/a'}) = {ct_input_val or 'empty'}")
+
+                # Dump param introspection to see actual names on this build
+                dump_params(tex_shader, "AI_Texture_Image")
+                dump_params(surf_shader, "Manual_Surface")
+                dump_params(planet, "Planet 01")
+
                 set_and_verify(planet, "surface_shader", surf_shader, is_node=True)
-                self.log_message("Connected Planet surface -> Manual_Surface shader")
+                self.log_message("Connected Planet surface -> Manual_Surface shader with texture")
             else:
                 set_and_verify(planet, "surface_shader", compute_terrain, is_node=True)
                 self.log_message("Connected Planet surface -> Compute Terrain")

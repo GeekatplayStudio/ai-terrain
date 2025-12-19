@@ -1,9 +1,11 @@
 import os
-from PIL import Image
-import json
-import requests
-import base64
+from datetime import datetime
 from io import BytesIO
+import base64
+import json
+
+from PIL import Image
+import requests
 
 class TerrainGeneratorAPI:
     def __init__(self):
@@ -249,3 +251,36 @@ class TerrainGeneratorAPI:
         if not result:
             raise Exception("No analysis returned for sky reference.")
         return result
+
+    def generate_heightfield(self, image_paths, generate_texture=True, status_callback=None):
+        """Generate heightmap (and optional texture), save to disk, and return file paths."""
+
+        def log(message):
+            if status_callback:
+                status_callback(message)
+            print(message)
+
+        # Reuse the existing image generation pipeline
+        images = self.generate_heightmap_images(image_paths, generate_texture, status_callback=log)
+        if not images:
+            raise Exception("No images returned from Gemini.")
+
+        output_dir = os.path.join(os.getcwd(), "outputs")
+        os.makedirs(output_dir, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        # Save heightmap
+        heightmap_img = images[0]
+        hf_filename = os.path.join(output_dir, f"heightfield_{timestamp}.png")
+        heightmap_img.save(hf_filename, format="PNG")
+        log(f"Saved heightfield to {hf_filename}")
+
+        texture_path = None
+        if generate_texture and len(images) > 1:
+            texture_img = images[1]
+            tex_filename = os.path.join(output_dir, f"texture_{timestamp}.png")
+            texture_img.save(tex_filename, format="PNG")
+            texture_path = tex_filename
+            log(f"Saved texture to {tex_filename}")
+
+        return {"heightfield_path": hf_filename, "texture_path": texture_path}
