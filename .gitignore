@@ -10,6 +10,8 @@ dummy.jpg
 
 # Build artifacts
 dist/
+!dist/
+!dist/TerrainAI.exe
 build/
 *.spec
 

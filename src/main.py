@@ -113,9 +113,6 @@ class TerrainApp(ctk.CTk):
         row2_bar = ctk.CTkFrame(self.sky_frame, fg_color="transparent")
         row2_bar.pack(fill="x", padx=10, pady=2)
 
-        self.add_cloud_btn = ctk.CTkButton(row2_bar, text="Add Manual Cloud Node", fg_color="#228b22", hover_color="#176617", command=self.create_cloud_node)
-        self.add_cloud_btn.pack(side="left", padx=5)
-
         self.add_clouds_from_analysis_btn = ctk.CTkButton(row2_bar, text="Create Clouds from Analysis", fg_color="#1f7a99", hover_color="#155a70", command=self.create_clouds_from_analysis)
         self.add_clouds_from_analysis_btn.pack(side="left", padx=5)
 
@@ -141,10 +138,6 @@ class TerrainApp(ctk.CTk):
         self.tools_frame.pack(fill="x", padx=20, pady=10)
         
         ctk.CTkLabel(self.tools_frame, text="Terragen Integration", font=ctk.CTkFont(weight="bold")).pack(anchor="w", padx=10, pady=5)
-        
-        self.source_selector = ctk.CTkSegmentedButton(self.tools_frame, values=["Manual Files", "Generated Result", "Uploaded Images"])
-        self.source_selector.pack(fill="x", padx=10, pady=5)
-        self.source_selector.set("Manual Files")
 
         self.manual_hf_path = None
         self.manual_tex_path = None
@@ -192,7 +185,8 @@ class TerrainApp(ctk.CTk):
             image_map_classes = ["image_map_shader_v2", "image_map_shader", "image_map_v3", "image_map"]
 
         # Surface shaders are generally consistent; keep a short list.
-        surface_classes = ["default_shader", "fractal_shader", "surface_layer"]
+        # Prefer surface_layer so we can layer over existing planet surfaces without replacing base shading
+        surface_classes = ["surface_layer", "default_shader", "fractal_shader"]
 
         compute_classes = ["compute_terrain"]
 
@@ -253,7 +247,7 @@ class TerrainApp(ctk.CTk):
         except Exception as e:
             messagebox.showerror("Error", f"Failed to read structure: {e}")
 
-    def deploy_to_terragen(self, hf_path, tex_path):
+    def deploy_to_terragen(self, hf_path, tex_path, append_mode=False):
         try:
             import terragen_rpc as tg
             project = tg.root()
@@ -263,9 +257,14 @@ class TerrainApp(ctk.CTk):
 
             self.log_message(f"--- Deploying to Terragen (HF: {os.path.basename(hf_path) if hf_path else 'None'}, Tex: {os.path.basename(tex_path) if tex_path else 'None'}) ---")
 
+            def _val_to_set(value, is_node=False):
+                if is_node and hasattr(value, "path"):
+                    return value.path()
+                return value
+
             def set_and_verify(node, param, value, is_node=False):
                 """Set a parameter and log the readback; return readback string."""
-                val_to_set = value.path() if is_node else value
+                val_to_set = _val_to_set(value, is_node)
                 node.set_param(param, val_to_set)
                 actual = node.get_param_as_string(param)
                 self.log_message(f"Set {node.name()}.{param} = '{val_to_set}' | Readback: '{actual}'")
@@ -273,11 +272,11 @@ class TerrainApp(ctk.CTk):
 
             def set_first_param(node, params, value, is_node=False):
                 """Try a list of parameter names; stop at first that reads back non-empty/matching."""
-                val_target = value.path() if is_node else value
+                val_target = _val_to_set(value, is_node)
                 for p in params:
                     try:
-                        actual = set_and_verify(node, p, value, is_node=is_node)
-                        if actual and (actual == val_target or actual.lower() == str(val_target).lower()):
+                        actual = set_and_verify(node, p, val_target, is_node=False)
+                        if actual and (actual == val_target or str(actual).lower() == str(val_target).lower()):
                             return p, actual
                     except Exception as e:
                         self.log_message(f"Param attempt failed {node.name()}.{p}: {e}")
@@ -293,6 +292,24 @@ class TerrainApp(ctk.CTk):
                     except Exception as e:
                         self.log_message(f"Read attempt failed {node.name()}.{p}: {e}")
                 return None, None
+
+            def copy_param_value(src_node, dst_node, src_params, dst_params, label):
+                """Copy first available value from src to dst using param name lists; log what sticks."""
+                src_param, src_val = get_first_param(src_node, src_params)
+                if not src_val:
+                    self.log_message(f"Copy {label}: source empty (checked {src_params})")
+                    return None, None, None
+                dst_param, dst_read = set_first_param(dst_node, dst_params, src_val, is_node=False)
+                self.log_message(f"Copy {label}: {src_param} -> {dst_param} | val '{src_val}' readback '{dst_read}'")
+                return src_val, dst_param, dst_read
+
+            def resolve_node_by_path(path_str):
+                if not path_str:
+                    return None
+                try:
+                    return tg.node_by_path(path_str)
+                except Exception:
+                    return None
 
             def dump_params(node, label):
                 """Attempt to list parameter names/values for debugging across Terragen builds."""
@@ -315,6 +332,44 @@ class TerrainApp(ctk.CTk):
                         pass
                 except Exception as e:
                     self.log_message(f"Failed to dump params for {label}: {e}")
+
+            def set_gui_pos(node, x, y):
+                """Try to set GUI position to avoid node stacking (best-effort)."""
+                try:
+                    node.set_param("gui_node_pos", f"{x} {y}")
+                except Exception:
+                    pass
+
+            def pick_param_by_substring(node, substrings):
+                """Pick the first param name containing any of the substrings (case-insensitive)."""
+                try:
+                    names = node.param_names()
+                except Exception:
+                    return None
+                lower = [n.lower() for n in names]
+                for sub in substrings:
+                    sub_l = sub.lower()
+                    for i, lname in enumerate(lower):
+                        if sub_l in lname:
+                            return names[i]
+                return None
+
+            def set_param_by_substring(node, substrings, value, is_node=False):
+                """Set the first parameter whose name contains any substring; return (param, readback)."""
+                try:
+                    names = node.param_names()
+                except Exception:
+                    names = []
+                for name in names:
+                    lname = name.lower()
+                    if any(sub.lower() in lname for sub in substrings):
+                        try:
+                            readback = set_and_verify(node, name, value, is_node=is_node)
+                            if readback:
+                                return name, readback
+                        except Exception as e:
+                            self.log_message(f"Param-by-substring attempt failed {node.name()}.{name}: {e}")
+                return None, None
 
             planet = tg.node_by_path("/Planet 01")
             if not planet:
@@ -380,25 +435,41 @@ class TerrainApp(ctk.CTk):
                 messagebox.showerror("Error", "Could not find Compute Terrain node. See log for available nodes.")
                 return
 
+            def _numbered_name(base_name):
+                """Generate a numbered name like AI_Base_01 to help user see connections."""
+                try:
+                    existing = [c.name() for c in project.children() if c.name().startswith(f"AI_{base_name}")]
+                    max_n = 0
+                    for n in existing:
+                        try:
+                            suffix = n.split("AI_" + base_name + "_")[-1]
+                            max_n = max(max_n, int(suffix))
+                        except Exception:
+                            continue
+                    return f"AI_{base_name}_{max_n + 1:02d}"
+                except Exception:
+                    return f"AI_{base_name}_01"
+
             def find_or_create(name, class_names):
-                """Locate node by name, then by acceptable class list; create using first class that works."""
+                """Locate node by name/prefix, then by acceptable class list; create using first class that works."""
                 node = tg.node_by_path(f"/{name}")
                 if node:
                     return node, True
 
-                # Look for any node with matching name among allowed classes
+                # Look for any node with matching base or AI_ prefix among allowed classes
                 for cls in class_names:
                     for c in project.children_filtered_by_class(cls):
-                        if c.name() == name:
+                        if c.name() == name or c.name().startswith(f"AI_{name}"):
                             return c, True
 
                 # Try to create using first working class
+                numbered = _numbered_name(name)
                 for cls in class_names:
                     try:
                         node = tg.create_child(project, cls)
                         if node:
-                            node.set_param("name", name)
-                            self.log_message(f"Created '{name}' using class '{cls}'")
+                            node.set_param("name", numbered)
+                            self.log_message(f"Created '{numbered}' using class '{cls}'")
                             return node, False
                     except Exception as create_err:
                         self.log_message(f"Create attempt failed for {name} class '{cls}': {create_err}")
@@ -407,26 +478,134 @@ class TerrainApp(ctk.CTk):
             hf_load, _ = find_or_create("Manual_HF_Load", ["heightfield_load"])
             if hf_path:
                 set_and_verify(hf_load, "filename", hf_path)
+            set_gui_pos(hf_load, -200, -200)
             
             hf_shader, _ = find_or_create("Manual_HF_Shader", ["heightfield_shader"])
             set_and_verify(hf_shader, "heightfield", hf_load, is_node=True)
+            set_gui_pos(hf_shader, -50, -200)
             
             current_ct_input = compute_terrain.get_param_as_string("input_node")
-            if current_ct_input != hf_shader.path():
-                if current_ct_input and current_ct_input != hf_shader.path():
-                    set_and_verify(hf_shader, "input_node", current_ct_input)
-                    self.log_message(f"Chained HF Shader -> Old Terrain Source ({current_ct_input})")
-                set_and_verify(compute_terrain, "input_node", hf_shader, is_node=True)
-                self.log_message("Connected Compute Terrain -> HF Shader")
+            current_ct_node = resolve_node_by_path(current_ct_input)
+
+            if append_mode:
+                self.log_message(f"Append mode enabled. Existing CT input: '{current_ct_input or 'none'}'")
+
+                # Try to reconstruct/align with common Terragen chain: Base PF -> Fractal Warp -> (optional mask) -> CT
+                warp_node, _ = find_or_create("Fractal Warp Shader 01", ["fractal_warp_shader"])
+                base_pf, _ = find_or_create("Power Fractal Base", ["power_fractal_shader_v3", "power_fractal_shader"])
+                mask_node, _ = find_or_create(
+                    "Valley Mask",
+                    ["simple_shape_shader", "power_fractal_shader_v3", "image_map_shader"],
+                )
+
+                # Wire warp input from existing chain or base PF
+                warp_input_params = ["input_node", "shader_input", "main_input", "input_primary"]
+                if current_ct_node:
+                    set_first_param(warp_node, warp_input_params, current_ct_node, is_node=True)
+                elif base_pf:
+                    set_first_param(warp_node, warp_input_params, base_pf, is_node=True)
+
+                # Mask into warp if available
+                mask_params = ["mask_input", "mask", "input_mask", "blend_input", "mix_input"]
+                if mask_node:
+                    set_first_param(warp_node, mask_params, mask_node, is_node=True)
+
+                # Create merger to blend existing/warp output with new HF
+                merger, _ = find_or_create("HF_Merger", ["merger_shader", "merge_shader", "merger"])
+                primary_params = ["input_node", "main_input", "primary_input", "input_primary", "input_a", "A"]
+                secondary_params = ["input_node_2", "secondary_input", "input_secondary", "input_b", "mask_input", "B", "input_B", "input_b"]
+                set_gui_pos(merger, 150, -200)
+
+                # Expand param names dynamically if available (helps builds with different labels)
+                dyn_primary = pick_param_by_substring(merger, ["primary", "input", "main", "a"])
+                if dyn_primary and dyn_primary not in primary_params:
+                    primary_params.insert(0, dyn_primary)
+                dyn_secondary = pick_param_by_substring(merger, ["secondary", "input 2", "b", "mask"])
+                if dyn_secondary and dyn_secondary not in secondary_params:
+                    secondary_params.insert(0, dyn_secondary)
+
+                # Log available params to aid debugging
+                try:
+                    self.log_message(f"Merger param_names(): {merger.param_names()}")
+                except Exception:
+                    pass
+
+                primary_source = warp_node if warp_node else current_ct_node
+                if primary_source:
+                    set_first_param(merger, primary_params, primary_source, is_node=True)
+                elif current_ct_input:
+                    # if only string path, pass directly
+                    set_first_param(merger, primary_params, current_ct_input, is_node=False)
+
+                set_first_param(merger, secondary_params, hf_shader, is_node=True)
+
+                # Verify merger wiring so we don't leave inputs empty; if secondary fails, hard-wire it via substring search
+                prim_param, prim_val = get_first_param(merger, primary_params)
+                sec_param, sec_val = get_first_param(merger, secondary_params)
+                if not sec_val:
+                    sec_param, sec_val = set_param_by_substring(merger, ["secondary", "input 2", "b", "mask"], hf_shader, is_node=True)
+                if not sec_val:
+                    # Try direct set_param with HF path for every known input-ish param
+                    try:
+                        for p in merger.param_names():
+                            if "input" in p.lower() or p.lower() in ("a", "b"):
+                                try:
+                                    merger.set_param(p, hf_shader.path())
+                                    sec_val = merger.get_param_as_string(p)
+                                    if sec_val:
+                                        sec_param = p
+                                        break
+                                except Exception:
+                                    continue
+                    except Exception:
+                        pass
+                self.log_message(
+                    f"Merger inputs -> primary ({prim_param or 'n/a'}) = {prim_val or 'empty'}, secondary ({sec_param or 'n/a'}) = {sec_val or 'empty'}"
+                )
+
+                if not sec_val:
+                    # Fallback: bypass merger so HF still drives CT
+                    set_and_verify(compute_terrain, "input_node", hf_shader, is_node=True)
+                    self.log_message("Merger secondary empty; fell back to Compute Terrain -> HF Shader directly")
+                else:
+                    set_and_verify(compute_terrain, "input_node", merger, is_node=True)
+                    self.log_message("Connected Compute Terrain -> HF_Merger (warp/existing + new HF)")
             else:
-                self.log_message("Compute Terrain already connected to HF Shader")
+                if current_ct_input != hf_shader.path():
+                    if current_ct_node and current_ct_input != hf_shader.path():
+                        set_and_verify(hf_shader, "input_node", current_ct_node, is_node=True)
+                        self.log_message(f"Chained HF Shader -> Old Terrain Source ({current_ct_input})")
+                    elif current_ct_input:
+                        set_and_verify(hf_shader, "input_node", current_ct_input, is_node=False)
+                        self.log_message(f"Chained HF Shader -> Old Terrain Source ({current_ct_input}) [string]")
+                    set_and_verify(compute_terrain, "input_node", hf_shader, is_node=True)
+                    self.log_message("Connected Compute Terrain -> HF Shader")
+                else:
+                    self.log_message("Compute Terrain already connected to HF Shader")
 
             if tex_path:
+                # Preserve existing planet surface chain so we don't override base shading
+                planet_surface_prev = planet.get_param_as_string("surface_shader") or ""
+                planet_surface_node = resolve_node_by_path(planet_surface_prev)
+
                 surf_shader, _ = find_or_create("Manual_Surface", self.os_profile["surface_classes"])
-                set_and_verify(surf_shader, "input_node", compute_terrain, is_node=True)
+                set_gui_pos(surf_shader, 100, 100)
+
+                # Prefer to chain on top of existing planet surface; fall back to compute terrain
+                base_surface_target = planet_surface_node if planet_surface_node else compute_terrain
+                set_and_verify(surf_shader, "input_node", base_surface_target, is_node=True)
+
+                # If readback is empty or not the CT when we expect it, force CT to ensure displacement context
+                surf_in_param, surf_in_val = get_first_param(surf_shader, ["input_node", "shader_input", "surface_shader_input"])
+                if not surf_in_val:
+                    set_and_verify(surf_shader, "input_node", compute_terrain, is_node=True)
+                elif surf_in_val == planet_surface_prev:
+                    # Try to rewire to compute terrain when previous surface couldn't resolve a node
+                    set_and_verify(surf_shader, "input_node", compute_terrain, is_node=True)
 
                 # Create or reuse an image map shader to feed the texture into the surface shader
                 tex_shader, _ = find_or_create("AI_Texture_Image", self.os_profile["image_map_classes"])
+                set_gui_pos(tex_shader, 300, 100)
                 # Try multiple filename params (covering US/UK spellings and legacy names)
                 filename_params = [
                     "image_filename",
@@ -442,31 +621,51 @@ class TerrainApp(ctk.CTk):
                     f"Texture file set result -> param: {used_file_param or 'none'}, readback: {file_readback or 'empty'}"
                 )
 
-                # Attempt to force full-coverage planar projection aligned to the heightfield domain
+                # Mapping: Plan Y, use actual image dimensions, center at origin, repeats/flip off
                 projection_params = ["projection", "mapping_mode", "map_projection", "mapping"]
                 set_first_param(tex_shader, projection_params, "Plan Y", is_node=False)
 
-                # Use ~10km domain to match heightfield load (1023px over 10,000m)
-                domain_size = "10000 10000 10000"
+                try:
+                    img_w, img_h = Image.open(tex_path).size
+                except Exception as e:
+                    self.log_message(f"Failed to read texture size: {e}")
+                    img_w, img_h = 1024, 1024
+                img_sz3 = max(img_w, img_h)
+                size_str = f"{img_w} {img_h}"
+
                 size_params = ["size", "map_size", "tile_size", "scale", "repeat_scale", "texture_size"]
-                set_first_param(tex_shader, size_params, domain_size, is_node=False)
+                set_first_param(tex_shader, size_params, size_str, is_node=False)
 
                 size_xy_params = [
-                    ("size_x", "10000"),
-                    ("size_y", "10000"),
-                    ("size_z", "10000"),
-                    ("repeat_x", "1"),
-                    ("repeat_y", "1"),
+                    ("size_x", str(img_w)),
+                    ("size_y", str(img_h)),
+                    ("repeat_x", "0"),
+                    ("repeat_y", "0"),
                 ]
                 for p, v in size_xy_params:
                     set_first_param(tex_shader, [p], v, is_node=False)
 
-                center_params = ["position_center", "center", "map_center", "offset", "origin"]
+                center_params = [
+                    "position_center",
+                    "center",
+                    "map_center",
+                    "offset",
+                    "origin",
+                    "position",
+                    "centre",
+                    "pivot",
+                ]
                 set_first_param(tex_shader, center_params, "0 0 0", is_node=False)
 
-                # Disable tiling/repeat if such toggles exist
-                repeat_flags = ["tile", "tiling", "repeat", "wrap", "use_repeat", "repeat_enabled"]
+                # Explicitly request center-origin mode using known params from param dump
+                set_first_param(tex_shader, ["position_center"], "1", is_node=False)
+                set_first_param(tex_shader, ["position_lower_left"], "0", is_node=False)
+
+                # Disable tiling/repeat and flips if such toggles exist
+                repeat_flags = ["tile", "tiling", "repeat", "wrap", "use_repeat", "repeat_enabled", "clamp"]
                 set_first_param(tex_shader, repeat_flags, "0", is_node=False)
+                flip_flags = ["flip", "flip_x", "flip_y", "mirror_x", "mirror_y"]
+                set_first_param(tex_shader, flip_flags, "0", is_node=False)
 
                 # Try multiple possible color input params across Terragen variants
                 color_params = [
@@ -499,7 +698,7 @@ class TerrainApp(ctk.CTk):
                 dump_params(planet, "Planet 01")
 
                 set_and_verify(planet, "surface_shader", surf_shader, is_node=True)
-                self.log_message("Connected Planet surface -> Manual_Surface shader with texture")
+                self.log_message("Connected Planet surface -> Manual_Surface shader with texture (layered)")
             else:
                 set_and_verify(planet, "surface_shader", compute_terrain, is_node=True)
                 self.log_message("Connected Planet surface -> Compute Terrain")
@@ -644,25 +843,20 @@ class TerrainApp(ctk.CTk):
             self.tex_preview_lbl.configure(text=os.path.basename(path))
 
     def send_to_terragen(self):
-        source = self.source_selector.get()
-        hf_path = None
-        tex_path = None
+        """Send the best-available heightfield/texture without source selection."""
+        # Priority: generated result -> manual selection -> uploaded images fallback
+        hf_path = self.heightfield_path or self.manual_hf_path
+        tex_path = self.generated_texture_path or self.manual_tex_path
 
-        if source == "Manual Files":
-            hf_path = self.manual_hf_path
-            tex_path = self.manual_tex_path
-        elif source == "Generated Result" and self.last_result:
-            hf_path = self.heightfield_path
-            tex_path = self.generated_texture_path
-        elif source == "Uploaded Images" and self.image_paths:
+        if not hf_path and self.image_paths:
             hf_path = self.image_paths[0]
             tex_path = self.image_paths[1] if len(self.image_paths) > 1 else None
 
         if not hf_path:
-            messagebox.showerror("Error", "No heightfield selected or available.")
+            messagebox.showerror("Error", "No heightfield available. Generate or select a heightfield first.")
             return
 
-        self.deploy_to_terragen(hf_path, tex_path)
+        self.deploy_to_terragen(hf_path, tex_path, append_mode=False)
 
     def upload_sky_reference(self):
         path = filedialog.askopenfilename(title="Select Sky Image", filetypes=[("Image files", "*.png *.jpg *.jpeg *.webp")])
